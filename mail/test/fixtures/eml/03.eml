@@ -1,0 +1,9 @@
+From: newsletter@example.com
+To: test@local
+Subject: Weekly Digest
+Date: Fri, 25 Sep 2026 12:00:00 +0800
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<html><body><p>本周<strong>学术动态</strong>汇总，请查收。</p></body></html>

@@ -1,0 +1,10 @@
+From: Alice <alice@example.com>
+To: test@local
+Subject: Team meeting
+Date: Fri, 25 Sep 2026 11:00:00 +0800
+Message-ID: <m2@test.local>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Weekly sync at 10am. Bring your notes.

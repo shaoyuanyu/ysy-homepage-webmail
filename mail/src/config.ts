@@ -1,0 +1,34 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { AccountConfig, AccountsFile, CredentialsFile } from "./types.js";
+
+/** 邮件库根目录：accounts.json / credentials.json / mail.db / eml/ */
+export function mailDataDir(): string {
+  return process.env.MAIL_DATA_DIR ?? join(process.cwd(), "data", "mail");
+}
+
+export function loadAccounts(dir: string = mailDataDir()): AccountConfig[] {
+  const raw = JSON.parse(readFileSync(join(dir, "accounts.json"), "utf8")) as AccountsFile;
+  if (!Array.isArray(raw.accounts)) {
+    throw new Error("accounts.json 缺少 accounts 数组");
+  }
+  for (const a of raw.accounts) {
+    if (!a.id || !a.displayName || !a.email || !a.imapHost) {
+      throw new Error(`accounts.json: 账号缺少必填字段（id/displayName/email/imapHost）`);
+    }
+    if (!Number.isInteger(a.imapPort)) {
+      throw new Error(`accounts.json: ${a.id} 的 imapPort 非法`);
+    }
+    if (typeof a.imapSecure !== "boolean") {
+      throw new Error(`accounts.json: ${a.id} 的 imapSecure 非法`);
+    }
+    if (!Array.isArray(a.folders) || a.folders.length === 0) {
+      throw new Error(`accounts.json: ${a.id} 的 folders 为空`);
+    }
+  }
+  return raw.accounts;
+}
+
+export function loadCredentials(dir: string = mailDataDir()): CredentialsFile {
+  return JSON.parse(readFileSync(join(dir, "credentials.json"), "utf8")) as CredentialsFile;
+}
