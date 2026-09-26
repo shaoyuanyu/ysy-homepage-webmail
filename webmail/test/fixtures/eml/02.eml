@@ -1,0 +1,10 @@
+From: newsletter@example.com
+To: test2@local
+Subject: Weekly Digest
+Date: Fri, 25 Sep 2026 11:00:00 +0800
+Message-ID: <w02@test.local>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This week in research: three papers you should read.
