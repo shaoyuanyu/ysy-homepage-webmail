@@ -162,7 +162,6 @@ function listMessages(ctx: WebmailContext, url: URL) {
 async function messageDetail(ctx: WebmailContext, messageId: string) {
   const row = messageOf(ctx, messageId);
   if (!row) return null;
-  const copies = copiesOf(ctx, messageId);
   const base = { ...listItem(ctx, row), to: JSON.parse(row.to_json), cc: JSON.parse(row.cc_json) };
   if (!row.eml_path) {
     return { ...base, text: "", html: "", attachments: [], remoteBlocked: 0 };
