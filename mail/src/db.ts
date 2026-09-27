@@ -70,3 +70,19 @@ function migrate(db: Db): void {
     );
   `);
 }
+
+/**
+ * 工具面入口的 messageId 宽容归一：库键（`mid:` / `auto:` 前缀）直接用；
+ * 裸 Message-ID（`<x@y>` 或 `x@y`，大小写不敏感）补 `mid:` 前缀再查。
+ * 只返回本地索引里确实存在的键，查不到返回 null（3.5：不接受任意传入的值）。
+ */
+export function resolveMessageKey(db: Db, input: string): string | null {
+  const exists = db.prepare("SELECT 1 AS x FROM messages WHERE message_id = ?");
+  if (exists.get(input)) return input;
+  const bare = input.replace(/[<>]/g, "").trim().toLowerCase();
+  if (bare) {
+    const key = `mid:${bare}`;
+    if (key !== input && exists.get(key)) return key;
+  }
+  return null;
+}

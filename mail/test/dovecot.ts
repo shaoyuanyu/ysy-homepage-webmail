@@ -33,6 +33,13 @@ userdb {
 log_path = /dev/stderr
 `;
 
+/** Sent 带 special_use 标志位（RFC 6154），供发信留底的探测逻辑走主路径 */
+const SPECIAL_USE_BLOCK = `  mailbox Sent {
+    special_use = \\Sent
+    auto = create
+  }
+`;
+
 export interface DovecotHandle {
   container: string;
   host: string;
@@ -43,14 +50,17 @@ export interface DovecotHandle {
   cleanup(): void;
 }
 
-export function startDovecot(suffix: string): DovecotHandle {
+export function startDovecot(suffix: string, opts: { specialUse?: boolean } = {}): DovecotHandle {
   const name = `maild-test-${suffix}-${process.pid}`;
   execSync(`${CONTAINER_BIN} rm -f ${name} >/dev/null 2>&1 || true`);
 
   const dir = join(workRoot, `dovecot-${suffix}`);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "dovecot.conf"), DOVECOT_CONF);
+  const conf = opts.specialUse
+    ? DOVECOT_CONF.replace("  inbox = yes\n", `  inbox = yes\n${SPECIAL_USE_BLOCK}`)
+    : DOVECOT_CONF;
+  writeFileSync(join(dir, "dovecot.conf"), conf);
   writeFileSync(join(dir, "users"), "test:{PLAIN}test::::::\n");
 
   const args = [

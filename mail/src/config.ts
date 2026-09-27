@@ -32,3 +32,19 @@ export function loadAccounts(dir: string = mailDataDir()): AccountConfig[] {
 export function loadCredentials(dir: string = mailDataDir()): CredentialsFile {
   return JSON.parse(readFileSync(join(dir, "credentials.json"), "utf8")) as CredentialsFile;
 }
+
+/** CalDAV 写入配置（create_event 用）：accounts.json 的 caldav 段 + credentials.json 的 "caldav" 键 */
+export function loadCaldav(
+  dir: string = mailDataDir()
+): { url: string; collection: string; username: string; password: string } | null {
+  const raw = JSON.parse(readFileSync(join(dir, "accounts.json"), "utf8")) as AccountsFile;
+  if (!raw.caldav?.url) return null;
+  const cred = loadCredentials(dir)["caldav"];
+  if (!cred) return null;
+  return {
+    url: raw.caldav.url.replace(/\/$/, ""),
+    collection: raw.caldav.collection ?? "agent-schedule",
+    username: cred.username,
+    password: cred.password,
+  };
+}
