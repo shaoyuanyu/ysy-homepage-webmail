@@ -2,7 +2,7 @@ import type { ImapFlow } from "imapflow";
 import type { Db } from "./db.js";
 import { connectAccount } from "./imap.js";
 import { syncAccount } from "./fetcher.js";
-import type { AccountConfig, AccountCredential } from "./types.js";
+import type { AccountConfig, AccountCredential, SyncResult } from "./types.js";
 
 /** 兜底轮询间隔：IDLE 不可用或漏事件时仍有新鲜度保证（5.1） */
 const POLL_INTERVAL_MS = 3 * 60 * 1000;
@@ -14,13 +14,15 @@ function sleep(ms: number): Promise<void> {
 /**
  * 事件驱动监听：连上后先补抓（重连期间到达的邮件），随后 IDLE 等待
  * exists 事件触发增量；断线指数退避重连。signal 触发优雅停机。
+ * onSynced：每次增量完成后回调（触发接线投任务用，5.1）
  */
 export async function watchAccount(
   db: Db,
   dataDir: string,
   account: AccountConfig,
   cred: AccountCredential,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSynced?: (results: SyncResult[]) => void
 ): Promise<void> {
   let failures = 0;
   while (!signal?.aborted) {
@@ -28,7 +30,7 @@ export async function watchAccount(
     try {
       client = await connectAccount(account, cred);
       failures = 0;
-      await idleLoop(db, dataDir, client, account, cred, signal);
+      await idleLoop(db, dataDir, client, account, cred, signal, onSynced);
     } catch (err) {
       if (signal?.aborted) return;
       failures++;
@@ -47,7 +49,8 @@ async function idleLoop(
   client: ImapFlow,
   account: AccountConfig,
   cred: AccountCredential,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSynced?: (results: SyncResult[]) => void
 ): Promise<void> {
   let syncing = false;
   let pending = false;
@@ -64,6 +67,7 @@ async function idleLoop(
           console.log(`[${r.accountId}] ${r.folder}: +${r.fetched} 封`);
         }
       }
+      onSynced?.(results);
     } catch (err) {
       // 同步失败：断开连接，由 idle() 的异常冒到外层重连（重连后会先补抓）
       console.error(`[${account.id}] 同步失败，断开以触发重连`, err);

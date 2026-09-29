@@ -52,6 +52,49 @@ function migrate(db: AgentDb): void {
       status TEXT NOT NULL DEFAULT 'pending',  -- pending / sent / discarded
       decided_at TEXT
     );
+
+    -- 任务队列（5.1：邮件到达即投入；worker 池原子领取）
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,              -- judge / command / report
+      message_id TEXT,                 -- judge/command 关联的邮件（库键）
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      priority INTEGER NOT NULL DEFAULT 0,  -- 指令任务最高（3.6）
+      status TEXT NOT NULL DEFAULT 'pending',  -- pending / running / done / failed
+      attempts INTEGER NOT NULL DEFAULT 0,
+      run_after TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      started_at TEXT,
+      finished_at TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS tasks_pick ON tasks(status, run_after, priority DESC, id);
+
+    -- 结构化判定（5.2：一封信一行，重判覆盖；必须带模型+提示词版本）
+    CREATE TABLE IF NOT EXISTS judgment (
+      message_id TEXT PRIMARY KEY,
+      verdict TEXT NOT NULL,           -- important / normal / noise
+      labels_json TEXT NOT NULL DEFAULT '[]',  -- todo / event / ...
+      confidence REAL NOT NULL DEFAULT 0,
+      model TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      judged_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
+    -- 推理记录（5.2：一次处理一行，只追加不覆盖）
+    CREATE TABLE IF NOT EXISTS reasoning (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id TEXT,
+      run_kind TEXT NOT NULL,          -- run / followup / rejudge / command / report
+      trace TEXT,                      -- 模型真实推理输出（拿得到时）
+      summary TEXT,                    -- agent 自述的处理说明（不是证据，字段分开）
+      model TEXT NOT NULL,
+      prompt_version TEXT NOT NULL,
+      tokens INTEGER,
+      started_at TEXT NOT NULL,
+      finished_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE INDEX IF NOT EXISTS reasoning_message ON reasoning(message_id, id DESC);
   `);
 }
 

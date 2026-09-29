@@ -45,9 +45,11 @@ export async function syncFolder(
 
   // 增量：先取 envelope 级元数据，按大小决定是否下载原文
   let fetched = 0;
+  const ingested: { messageId: string; created: boolean }[] = [];
   for (const meta of await listNewMeta(client, folder, lastSeenUid)) {
     const source = meta.size > MAX_SOURCE_BYTES ? undefined : (await fetchSource(client, meta.uid)) ?? undefined;
-    await ingestMessage(db, dataDir, { accountId: account.id, folder, meta, source });
+    const r = await ingestMessage(db, dataDir, { accountId: account.id, folder, meta, source });
+    ingested.push({ messageId: r.messageId, created: r.created });
     fetched++;
     if (meta.uid > lastSeenUid) lastSeenUid = meta.uid;
   }
@@ -73,7 +75,7 @@ export async function syncFolder(
        last_flags_sync = excluded.last_flags_sync`
   ).run(account.id, folder, uidValidity, lastSeenUid, new Date().toISOString());
 
-  return { accountId: account.id, folder, rebuilt, fetched, flagsUpdated };
+  return { accountId: account.id, folder, rebuilt, fetched, flagsUpdated, ingested };
 }
 
 export async function syncAccount(

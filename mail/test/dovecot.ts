@@ -50,6 +50,19 @@ export interface DovecotHandle {
   cleanup(): void;
 }
 
+/** 预先抢占一个空闲宿主端口：docker restart 会给「宿主端口 0」的映射重新随机分配（podman 不会），
+ *  固定端口后 UIDVALIDITY 用例的 restart 才能在两种运行时下都保持端口不变 */
+function pickFreePort(): number {
+  // net.listen 是异步的而本函数需同步返回，借子进程同步取一个空闲端口（仅测试 harness 用）
+  const out = execFileSync(process.execPath, [
+    "-e",
+    "const s=require('node:net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close()})",
+  ], { encoding: "utf8" });
+  const port = Number(out.trim());
+  if (!Number.isInteger(port) || port <= 0) throw new Error(`无法分配空闲端口：${out}`);
+  return port;
+}
+
 export function startDovecot(suffix: string, opts: { specialUse?: boolean } = {}): DovecotHandle {
   const name = `maild-test-${suffix}-${process.pid}`;
   execSync(`${CONTAINER_BIN} rm -f ${name} >/dev/null 2>&1 || true`);
@@ -73,7 +86,7 @@ export function startDovecot(suffix: string, opts: { specialUse?: boolean } = {}
     "-v",
     `${dir}/users:/etc/dovecot/users:Z`,
     "-p",
-    "127.0.0.1::143",
+    `127.0.0.1:${pickFreePort()}:143`,
   ];
   args.push(IMAGE);
   execFileSync(CONTAINER_BIN, args, { stdio: "pipe" });

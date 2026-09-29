@@ -48,3 +48,19 @@ export function loadCaldav(
     password: cred.password,
   };
 }
+
+/** 模型配置（worker 池用）：accounts.json 的 model 段 + credentials.json 的 "model" 键（apiKey） */
+export function loadModel(
+  dir: string = mailDataDir()
+): { baseURL: string; model: string; apiKey: string; reportHour: number } | null {
+  const raw = JSON.parse(readFileSync(join(dir, "accounts.json"), "utf8")) as AccountsFile;
+  if (!raw.model?.baseURL || !raw.model.model) return null;
+  const apiKey = loadCredentials(dir)["model"]?.password;
+  if (!apiKey) return null;
+  return {
+    baseURL: raw.model.baseURL.replace(/\/$/, ""),
+    model: raw.model.model,
+    apiKey,
+    reportHour: raw.model.reportHour ?? 21,
+  };
+}

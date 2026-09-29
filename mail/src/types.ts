@@ -31,9 +31,20 @@ export interface CaldavConfig {
   collection?: string;
 }
 
+/** 模型配置（accounts.json 顶层的 model 段；apiKey 在 credentials.json 的 model 键） */
+export interface ModelConfig {
+  /** OpenAI 兼容端点，如 https://api.deepseek.com/v1 */
+  baseURL: string;
+  /** 模型名，如 deepseek-chat */
+  model: string;
+  /** 每日汇报的小时（本地时间，缺省 21） */
+  reportHour?: number;
+}
+
 export interface AccountsFile {
   accounts: AccountConfig[];
   caldav?: CaldavConfig;
+  model?: ModelConfig;
 }
 
 export type CredentialsFile = Record<string, AccountCredential>;
@@ -45,4 +56,6 @@ export interface SyncResult {
   rebuilt: boolean;
   fetched: number;
   flagsUpdated: number;
+  /** 本次新入库的邮件（库键 + 是否首次出现）；触发接线用它投 judge/command 任务 */
+  ingested: { messageId: string; created: boolean }[];
 }

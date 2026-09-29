@@ -33,7 +33,7 @@ accounts.json      账号注册表（id/显示名/地址/服务商/颜色/IMAP �
                    agent 账号另有 isAgent + smtpHost/smtpPort/smtpSecure；顶层 caldav 段供 create_event）
 credentials.json   凭据（按账号 id 索引；caldav 键存 Radicale 用户名密码；chmod 600，勿入库）
 mail.db            SQLite 索引（WAL）——纯原始邮件索引
-agent.db           工具层产物库（台账 + 待确认队列；5.2 的 judgment/reasoning 届时也进这里）
+agent.db           工具层/模型产物库（台账 + 待确认队列 + tasks 任务队列 + judgment/reasoning）
 eml/               原文留存（sha1(message_id).eml；超 50MB 只存元数据，MAIL_MAX_SOURCE_BYTES 可调）
 ```
 
@@ -48,6 +48,19 @@ agent 只能调这 8 个工具——**没有删除、移动、EXPUNGE 的函数*
 - **确认不 exposed 成 MCP 工具**：`/pending-sends/:id/confirm|discard` 只在 HTTP 端点上，agent 不能自己给自己的外发开闸（3.7）。
 - **UID 错位防护**：`set_flags` 写每个副本前，先取服务端 envelope 核对 UID 仍指向同一 Message-ID，错位即跳过（等下轮同步重建）。
 
+## agent worker 池与产物（第 4 步）
+
+- **worker 池在 maild 进程内**（并发缺省 3，`MAILD_WORKER_CONCURRENCY` 可调），但**工具调用一律经 MCP client 走 HTTP 自连**（`127.0.0.1:9711`）：worker 侧模块（`worker/judge/model/queue`）不 import 凭据/IMAP/SMTP，audit 测试扫 import 清单锁定，将来拆独立容器零代码改动。
+- **任务队列 = `agent.db` 的 `tasks` 表**：原子领取靠一条 `UPDATE ... WHERE id = (SELECT ... ORDER BY priority DESC, id LIMIT 1) RETURNING`（better-sqlite3 同步 API 单进程天然串行）；失败指数退避 `run_after`（2^attempts 分钟），3 次后标 `failed`。
+- **触发接线（`trigger.ts`）**：入库新邮件 → 指令认证 → 投任务。**只处理 `created = true` 的邮件**（多副本重复入库不重复投，指令邮件尤其不能执行两次）。
+- **指令认证（`auth.ts`，3.6）**：From 在白名单（注册表里除 agent 外的账号地址）+ SPF/DKIM **双双通过**（mailauth 自验，`trustReceived: true` 从 Received 链取第一跳验 SPF），不依赖服务商的 `Authentication-Results`；认证异常一律按普通邮件处理（宁可误判为 judge）。`resolver` 可注入 DNS 解析器，测试离线可跑。
+- **judge**：`generateObject` + zod → `verdict(important|normal|noise)` + `labels[]` + `confidence` + 一句话说明；`judgment` 一封信一行（重判覆盖），`reasoning` 一次处理一行（只追加）；labels 含 `event` 时经 MCP `create_event` 写日历（写失败不影响判定落库）。
+- **command**：指令正文 → `generateText` + MCP tools + `stopWhen: stepCountIs(10)` 多轮工具调用 → 回执经 `send_as_agent` 发给指令来源（白名单内直发）。
+- **report**：每日 21:00（`model.reportHour` 可配）汇总当日判定分布 + 重要清单 + 待确认队列提醒，发 `me@`。
+- **模型配置**：`accounts.json` 顶层 `model` 段（`baseURL`/`model`/`reportHour`），apiKey 在 `credentials.json` 的 `model` 键；provider 一律 `@ai-sdk/openai-compatible`（DeepSeek/Kimi/GLM 同端点形态）。**未配置 model 段时 worker 池不启动，任务照常入库，配置后重启即消费**。
+- **模型客户端可注入**：worker/judge 只认 `LanguageModel` 实例——生产 `createModel()` 走 AI SDK，测试注入 `MockLanguageModel`，模型层测试不依赖外部 API。
+- **prompt_version 是代码常量**（`JUDGE_PROMPT_VERSION` 等），改提示词时递增，随判定落库（5.2「当时为什么这么判」可答）。
+
 ## 命令
 
 ```bash
@@ -58,7 +71,7 @@ pnpm test                         # 测试（集成用例需要容器：CONTAINE
 pnpm typecheck
 ```
 
-## 测试（45 条，test/）
+## 测试（69 条，test/）
 
 集成用例对真实 Dovecot 容器断言，本机用 rootless podman（`CONTAINER_BIN=podman`），CI 用 docker：
 
@@ -67,13 +80,18 @@ pnpm typecheck
 - UIDVALIDITY 变化后重建该文件夹索引，孤儿 message 一并清理。
 - IDLE 唤醒（新邮件 631ms 入库，不等兜底轮询）与优雅停机。
 - trigram 模糊搜索 6 条（`test/search.test.ts`）。
-- **audit（4 条）**：源码扫描——STORE 只在 `flags.ts`（且无整体替换语义）、APPEND/SMTP 只在 `send.ts`、全包无 EXPUNGE/MOVE/DELETE、`flags.ts` 之外的 `mailboxOpen` 一律 readOnly。
+- **audit（5 条）**：源码扫描——STORE 只在 `flags.ts`（且无整体替换语义）、APPEND/SMTP 只在 `send.ts`、全包无 EXPUNGE/MOVE/DELETE、`flags.ts` 之外的 `mailboxOpen` 一律 readOnly、**worker 侧模块不 import 凭据/IMAP/SMTP/工具面服务端（5.3）**。
 - **flags（4 条）**：多副本一起写、前值/后值落台账、`\Answered` 不受影响、索引外消息与空 change 拒绝。
 - **send（7 条）**：白名单直发且 SMTP 与留底字节一致；白名单外进队列、确认原样发出、丢弃永不发出、重复处理拒绝；cc 外发同样触发闸门；找不到「已发送」拒发且 SMTP 不发出。
 - **events（6 条）**：ICS 构造（UTC 化、转义、缺省 end）、MKCOL 建集合路径、PUT 失败落失败台账。
 - **tools（10 条）**：MCP `tools/list` 恰好 8 个工具、无凭据字段泄漏、search→read 链路、宽容归一、失败调用落台账、`/ledger` `/pending-sends` `/health` 形状、confirm 对不存在 id 的报错、未知端点 404。
+- **auth（7 条）**：白名单不含 agent 自己；SPF/DKIM 双过才是指令；From 不在白名单/SPF 伪造/缺 DKIM/签名后篡改正文都不是指令；DNS 全灭按普通邮件处理。
+- **queue（5 条）**：领取顺序 command > report > judge、`run_after` 未到期不领、领取置 running 且 attempts+1、失败退避重投三次后 failed、计数汇总。
+- **judge（3 条）**：结构化判定 + 推理文本 + token 数；模型不给推理时 reasoningText 为 null（两种文本分开存）；judgment 重判覆盖、reasoning 只追加。
+- **model（4 条）**：model 段 + apiKey 齐备才返回配置、reportHour 缺省 21、baseURL 尾斜杠归一、`createModel` 不发请求。
+- **worker（4 条，真实 Dovecot + MCP 自连 + MockLanguageModel）**：judge 全链路（read_message 经 MCP → judgment/reasoning 落库 + 台账）、judge 出 event 写 CalDAV、command 多轮工具调用 + 回执发给指令来源、report 汇总 + 待确认提醒发 reportTo。
 
-容器约定：不挂 maildir 卷（rootless 下 userns 映射会让 dovecot 起不来），投放走 IMAP `APPEND`，重建 UIDVALIDITY 走 `exec rm -rf /srv/mail/<user>`。dovecot 的 UIDVALIDITY 是秒级时间戳，重建后须跨秒再投放。发信用例需要 `Sent` 的 special_use 标志位（`startDovecot(name, { specialUse: true })`）。SMTP 接收端复用 `webmail/test/smtp-sink.ts`（smtp-server 内存桩）。
+容器约定：不挂 maildir 卷（rootless 下 userns 映射会让 dovecot 起不来），投放走 IMAP `APPEND`，重建 UIDVALIDITY 走 `exec rm -rf /srv/mail/<user>`。dovecot 的 UIDVALIDITY 是秒级时间戳，重建后须跨秒再投放。发信用例需要 `Sent` 的 special_use 标志位（`startDovecot(name, { specialUse: true })`）。SMTP 接收端复用 `webmail/test/smtp-sink.ts`（smtp-server 内存桩）。**宿主端口必须预先抢占固定（`pickFreePort`），勿用 `-p 127.0.0.1::143` 的随机分配**——docker 在 restart 时会为宿主端口 0 的映射重新随机分配（podman 不会），UIDVALIDITY 用例 restart 后拿着旧端口必 ECONNREFUSED（第 4 步实测踩中，白等 90s waitReady 超时）。
 
 ## 实现经验（都是实测踩过的）
 
