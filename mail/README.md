@@ -1,6 +1,6 @@
 # maild · 邮件抓取与索引 + 受限工具面
 
-MAIL-AGENT.md 第八节第 1、3 步的实现。独立包、独立进程：agent 侧的邮件凭据只落在本进程（文档 5.3 第一条）。
+MAIL-AGENT.md 第八节第 1、3、4、5 步的实现。独立包、独立进程：agent 侧的邮件凭据只落在本进程（文档 5.3 第一条）。
 
 **边界**：对外部数据源与 `me@` 只读——打开邮箱一律 `EXAMINE`，取正文一律 `BODY.PEEK[]`；包内写调用只有两个落点：`flags.ts`（唯一 `STORE`，3.5）与 `send.ts`（唯一 `APPEND`/SMTP，只写 `agent@` 自己的「已发送」，3.3/3.4）。`test/audit.test.ts` 把这条审查项机器化（扫源码断言落点唯一），删光实现也会红（防假绿）。
 
@@ -21,7 +21,8 @@ MAIL-AGENT.md 第八节第 1、3 步的实现。独立包、独立进程：agent
 | `src/events.ts` | `create_event`：写主站 CalDAV `agent-schedule` 集合（Radicale MKCOL/PUT，ICS 手工构造 + RFC 5545 转义折行） |
 | `src/reader.ts` | `read_message` / `get_attachment`：本地索引 + `.eml` 组装详情（eml_path 相对 dataDir，读取必须拼） |
 | `src/tools.ts` | 8 个固定工具的定义与 `callTool` 分发（每次调用先落台账，成功/失败都记） |
-| `src/mcp.ts` | 工具面 HTTP 服务：`POST /mcp`（MCP streamable HTTP，无状态）+ `GET /health` `/ledger` `/pending-sends` + `POST /pending-sends/:id/confirm|discard`，绑 `127.0.0.1:9711`（`MAILD_TOOLS_PORT` 可调） |
+| `src/mcp.ts` | 工具面 HTTP 服务：`POST /mcp`（MCP streamable HTTP，无状态）+ `GET /health` `/ledger` `/pending-sends` + `POST /pending-sends/:id/confirm|discard` + `/agent/*` 只读视图（第 5 步），绑 `127.0.0.1:9711`（`MAILD_TOOLS_PORT` 可调） |
+| `src/agentview.ts` | `/agent/*` 只读视图的查询逻辑（第 5 步）：timeline / message 详情 / .eml / rfc822 展开 / judgments / reasoning——只查 mail.db + agent.db，无写路径 |
 | `src/index.ts` | 入口：`--once` 单轮同步；无参数进入 IDLE 常驻并挂起工具面 |
 
 ## 数据目录
@@ -61,6 +62,18 @@ agent 只能调这 8 个工具——**没有删除、移动、EXPUNGE 的函数*
 - **模型客户端可注入**：worker/judge 只认 `LanguageModel` 实例——生产 `createModel()` 走 AI SDK，测试注入 `MockLanguageModel`，模型层测试不依赖外部 API。
 - **prompt_version 是代码常量**（`JUDGE_PROMPT_VERSION` 等），改提示词时递增，随判定落库（5.2「当时为什么这么判」可答）。
 
+## `/agent/*` 只读视图（第 5 步）
+
+`/mail/agent` 前端的数据通路（4.5：前端读 agent 导出的只读视图，不直连 agent 的库）。挂在 `mcp.ts` 的同一 HTTP 服务上，**一律 GET**（待确认队列的 confirm/discard 是人操作，仍走 POST）：
+
+- `GET /agent/timeline`：agent 账号全部副本合并时间线（收 + 发），方向按 from 是否 agent 地址；`(date, message_id)` 游标分页（`?limit=&before=`）。
+- `GET /agent/message/<key>`：原始头部块（折行保持）+ MIME 结构 + 附件列表 + text 正文 + copies + judgment 摘要 + reasoning 计数——**推理本体不在内**（5.2：只在展开单封信时才拉）。messageId 同样经 `resolveMessageKey` 宽容归一，且该信必须在 agent 账号有副本（入口 = agent 视角）。
+- `GET /agent/message/<key>/eml`：原件字节下载（`content-type: message/rfc822` + content-disposition），不经二次序列化。
+- `GET /agent/message/<key>/rfc822/<index>`：就地展开 `message/rfc822` 附件，返回同构的头部 + 结构 + 正文（4.3：汇报里附的原始邮件当场可核）。
+- `GET /agent/judgments` / `GET /agent/reasoning?message=<key>`：判定列表（关联 subject/from/date）与该信全部推理行。
+- 台账与待确认在 `/agent` 下再挂一份（`/agent/ledger` `/agent/pending-sends`）：前端只跟 `/agent/*` 一条通路打交道。
+- **展示原则（4.4）**：正文只给 `text/plain` 原文；只有 HTML 时给 sanitize 后的纯文本（`allowedTags: []`），结构里标注 html part——不渲染 HTML、不加载任何远程内容。
+
 ## 命令
 
 ```bash
@@ -71,7 +84,7 @@ pnpm test                         # 测试（集成用例需要容器：CONTAINE
 pnpm typecheck
 ```
 
-## 测试（69 条，test/）
+## 测试（77 条，test/）
 
 集成用例对真实 Dovecot 容器断言，本机用 rootless podman（`CONTAINER_BIN=podman`），CI 用 docker：
 
@@ -90,6 +103,7 @@ pnpm typecheck
 - **judge（3 条）**：结构化判定 + 推理文本 + token 数；模型不给推理时 reasoningText 为 null（两种文本分开存）；judgment 重判覆盖、reasoning 只追加。
 - **model（4 条）**：model 段 + apiKey 齐备才返回配置、reportHour 缺省 21、baseURL 尾斜杠归一、`createModel` 不发请求。
 - **worker（4 条，真实 Dovecot + MCP 自连 + MockLanguageModel）**：judge 全链路（read_message 经 MCP → judgment/reasoning 落库 + 台账）、judge 出 event 写 CalDAV、command 多轮工具调用 + 回执发给指令来源、report 汇总 + 待确认提醒发 reportTo。
+- **agentview（8 条）**：时间线收发合并与方向、游标分页；详情的原始头部/结构/text 正文（无渲染产物）；.eml 原件字节逐字一致（CRLF 保留）；rfc822 就地展开（含 HTML 的 inner 只给纯文本、远程 <img> 不在返回里）；rfc822 越界与非 rfc822 附件 404；索引外与「只在别的账号有副本」均 404；judgments 关联 subject/from、reasoning 按需拉取且 trace/summary 分开。
 
 容器约定：不挂 maildir 卷（rootless 下 userns 映射会让 dovecot 起不来），投放走 IMAP `APPEND`，重建 UIDVALIDITY 走 `exec rm -rf /srv/mail/<user>`。dovecot 的 UIDVALIDITY 是秒级时间戳，重建后须跨秒再投放。发信用例需要 `Sent` 的 special_use 标志位（`startDovecot(name, { specialUse: true })`）。SMTP 接收端复用 `webmail/test/smtp-sink.ts`（smtp-server 内存桩）。**宿主端口必须预先抢占固定（`pickFreePort`），勿用 `-p 127.0.0.1::143` 的随机分配**——docker 在 restart 时会为宿主端口 0 的映射重新随机分配（podman 不会），UIDVALIDITY 用例 restart 后拿着旧端口必 ECONNREFUSED（第 4 步实测踩中，白等 90s waitReady 超时）。
 

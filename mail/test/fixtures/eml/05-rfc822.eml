@@ -1,0 +1,41 @@
+From: =?UTF-8?B?YWdlbnQ=?= <agent@local>
+To: me@local
+Subject: =?UTF-8?B?5pel5oql5Yy65aSA?=
+Date: Sat, 26 Sep 2026 21:00:00 +0800
+Message-ID: <agent-report-1@test.local>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer-boundary"
+
+--outer-boundary
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+今日汇总：重要 1 封。原信附后，供核对。
+
+--outer-boundary
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="original.eml"
+
+From: =?UTF-8?B?5a+56Imy?= <prof@example.edu>
+To: agent@local
+Subject: =?UTF-8?B?54m55YiK5oqV56i/6YKA6K+3?=
+Date: Sat, 26 Sep 2026 09:30:00 +0800
+Message-ID: <paper-invite@test.local>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="inner-boundary"
+
+--inner-boundary
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+下个月截止的特刊，欢迎你投稿。
+
+--inner-boundary
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<p>下个月截止的特刊，<b>欢迎你投稿</b>。</p><img src="https://tracker.example.com/pixel.gif">
+
+--inner-boundary--
+
+--outer-boundary--

@@ -117,8 +117,12 @@ export function resetMaildir(handle: DovecotHandle): void {
   execFileSync(CONTAINER_BIN, ["exec", handle.container, "sh", "-c", "rm -rf /srv/mail/test"]);
 }
 
-/** 通过 IMAP APPEND 投放 fixtures 邮件（不带 \\Seen，即未读） */
-export async function deliverFixtures(handle: DovecotHandle, names: string[]): Promise<void> {
+/** 通过 IMAP APPEND 投放 fixtures 邮件（不带 \\Seen，即未读）；folder 缺省 INBOX */
+export async function deliverFixtures(
+  handle: DovecotHandle,
+  names: string[],
+  folder = "INBOX"
+): Promise<void> {
   const client = new ImapFlow({
     host: handle.host,
     port: handle.port,
@@ -129,7 +133,7 @@ export async function deliverFixtures(handle: DovecotHandle, names: string[]): P
   await client.connect();
   try {
     for (const n of names) {
-      const ok = await client.append("INBOX", readFileSync(join(fixturesDir, n)));
+      const ok = await client.append(folder, readFileSync(join(fixturesDir, n)));
       if (!ok) throw new Error(`APPEND 失败：${n}`);
     }
   } finally {

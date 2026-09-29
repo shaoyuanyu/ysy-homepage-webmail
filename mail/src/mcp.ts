@@ -4,6 +4,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { callTool, TOOLS, type ToolsContext } from "./tools.js";
 import { listLedger, listPendingSends } from "./ledger.js";
 import { confirmPendingSend, discardPendingSend } from "./send.js";
+import {
+  agentJudgments,
+  agentMessage,
+  agentMessageEml,
+  agentMessageRfc822,
+  agentReasoning,
+  agentTimeline,
+  AgentViewError,
+} from "./agentview.js";
 
 /**
  * 工具面 HTTP 服务（5.3）：MCP over streamable HTTP + 给前端/人工的 JSON 端点。
@@ -14,6 +23,7 @@ import { confirmPendingSend, discardPendingSend } from "./send.js";
  * - GET  /pending-sends                待确认外发队列（不含 MIME 字节）
  * - POST /pending-sends/:id/confirm    确认发出（人操作；不进 MCP，agent 不能给自己开闸）
  * - POST /pending-sends/:id/discard    丢弃
+ * - GET  /agent/*                      `/mail/agent` 只读视图（第 5 步）：timeline/message/eml/rfc822/judgments/reasoning
  */
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -82,6 +92,85 @@ export function createToolsServer(ctx: ToolsContext): Server {
         return sendJson(res, 200, { items: listPendingSends(ctx.agentDb) });
       }
 
+      // ---- /agent/* 只读视图（第 5 步；4.5：前端读 agent 导出的只读视图，无写路径）----
+      // 台账/待确认在 /agent 下再挂一份：前端只跟 /agent/* 打交道（站点代理一条通路）
+      if (req.method === "GET" && url.pathname === "/agent/ledger") {
+        const limit = url.searchParams.get("limit");
+        const beforeId = url.searchParams.get("beforeId");
+        return sendJson(res, 200, {
+          items: listLedger(ctx.agentDb, {
+            limit: limit ? Number(limit) : undefined,
+            beforeId: beforeId ? Number(beforeId) : undefined,
+          }),
+        });
+      }
+      if (req.method === "GET" && url.pathname === "/agent/pending-sends") {
+        return sendJson(res, 200, { items: listPendingSends(ctx.agentDb) });
+      }
+      const agentPendingMatch = url.pathname.match(/^\/agent\/pending-sends\/(\d+)\/(confirm|discard)$/);
+      if (req.method === "POST" && agentPendingMatch) {
+        const id = Number(agentPendingMatch[1]);
+        if (agentPendingMatch[2] === "confirm") {
+          const r = await confirmPendingSend({
+            agentDb: ctx.agentDb,
+            accounts: ctx.accounts,
+            creds: ctx.creds,
+            id,
+          });
+          return sendJson(res, 200, r);
+        }
+        await discardPendingSend({ agentDb: ctx.agentDb, id });
+        return sendJson(res, 200, { discarded: true });
+      }
+      if (req.method === "GET" && url.pathname === "/agent/timeline") {
+        return sendJson(
+          res,
+          200,
+          agentTimeline(ctx.db, ctx.accounts, {
+            limit: numOpt(url.searchParams.get("limit")),
+            before: url.searchParams.get("before") ?? undefined,
+          })
+        );
+      }
+      if (req.method === "GET" && url.pathname === "/agent/judgments") {
+        return sendJson(
+          res,
+          200,
+          agentJudgments(ctx.agentDb, ctx.db, {
+            limit: numOpt(url.searchParams.get("limit")),
+            before: url.searchParams.get("before") ?? undefined,
+          })
+        );
+      }
+      if (req.method === "GET" && url.pathname === "/agent/reasoning") {
+        const message = url.searchParams.get("message");
+        if (!message) throw new AgentViewError("缺少 message 参数");
+        return sendJson(res, 200, { items: agentReasoning(ctx.agentDb, message) });
+      }
+      const msgMatch = url.pathname.match(/^\/agent\/message\/([^/]+)(?:\/(eml|rfc822)(?:\/(\d+))?)?$/);
+      if (req.method === "GET" && msgMatch) {
+        const key = decodeURIComponent(msgMatch[1]);
+        const sub = msgMatch[2];
+        if (!sub) {
+          return sendJson(res, 200, await agentMessage(ctx.db, ctx.agentDb, ctx.dataDir, ctx.accounts, key));
+        }
+        if (sub === "eml") {
+          const { body, filename } = agentMessageEml(ctx.db, ctx.dataDir, ctx.accounts, key);
+          res.writeHead(200, {
+            "content-type": "message/rfc822",
+            "content-disposition": `attachment; filename="${filename}"`,
+          });
+          return res.end(body);
+        }
+        const index = Number(msgMatch[3]);
+        if (!Number.isInteger(index)) throw new AgentViewError("rfc822 需要附件下标");
+        return sendJson(
+          res,
+          200,
+          await agentMessageRfc822(ctx.db, ctx.dataDir, ctx.accounts, key, index)
+        );
+      }
+
       const pendingMatch = url.pathname.match(/^\/pending-sends\/(\d+)\/(confirm|discard)$/);
       if (req.method === "POST" && pendingMatch) {
         const id = Number(pendingMatch[1]);
@@ -100,9 +189,14 @@ export function createToolsServer(ctx: ToolsContext): Server {
 
       sendJson(res, 404, { error: `未知端点：${req.method} ${url.pathname}` });
     } catch (err) {
-      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      const status = err instanceof AgentViewError ? err.status : 500;
+      sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
     }
   });
+}
+
+function numOpt(v: string | null): number | undefined {
+  return v ? Number(v) : undefined;
 }
 
 export const TOOLS_PORT = Number(process.env.MAILD_TOOLS_PORT ?? 9711);
