@@ -51,7 +51,7 @@ export async function enqueueForIngested(opts: {
             tool: "command_auth",
             ok: auth.isCommand,
             messageId: item.messageId,
-            detail: { from: auth.from, spf: auth.spf, dkim: auth.dkim, reason: auth.reason },
+            detail: { from: auth.from, channel: auth.channel, spf: auth.spf, dkim: auth.dkim, reason: auth.reason },
           });
           isCommand = auth.isCommand;
         } catch (err) {
