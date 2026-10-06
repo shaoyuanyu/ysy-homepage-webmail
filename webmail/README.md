@@ -36,7 +36,7 @@ pnpm test                         # 测试（CONTAINER_BIN=podman pnpm test）
 pnpm typecheck
 ```
 
-## 测试（37 条，test/）
+## 测试（46 条，test/）
 
 集成用例对真实 Dovecot 容器断言，SMTP 侧用 `smtp-server` 起内存接收端：
 
@@ -45,6 +45,13 @@ pnpm typecheck
 - **API**：合并视图倒序 + 跨账号副本聚合、账号筛选、**状态 / 方向筛选（unseen / flagged / received / sent，方向口径与前端「已发送」徽章一致，见 src/write.ts 的 `SENT_FOLDER_NAMES`）**、trigram / LIKE 搜索、游标分页、远程图片白名单（剥除 / 保留 / cid 重写 / style url() 剥除）、附件端点、健康检查。
 - **通讯录**：CRUD + 邮箱唯一（`COLLATE NOCASE`）、自动收录（按通信次数聚合、排除自身账号与已保存地址）、`suggest` 顺序（已保存在前）、列表发件人名字被通讯录覆盖。
 - **账号管理**：校验分支（缺字段 / 邮箱非法 / 端口越界 / id 冲突 409 / folders 全空）、连接失败（密码错 / 不可达端口）**不落盘且进程不挂**、HTTP 400/502/201/DELETE、落盘后 `credentials.json` 为 600 且顶层字段不被覆盖、删除清理副本与孤儿消息、至少保留一个账号 409。
+
+## 容器镜像（`docker/webmail.Dockerfile`，镜像名 `webmail`）
+
+- **构建上下文 = 仓库根**：webmail 运行时 import `mail/` 的共享模块，且 Node 按「引用方所在目录」解析依赖——镜像里同时装两棵树：`webmail/node_modules`（全量，tsx 在 devDependencies、是运行时启动器）与 `mail/node_modules`（`--prod`）。
+- 构建：`docker build -f docker/webmail.Dockerfile -t webmail .`（better-sqlite3 在 alpine 上源码编译，python3/make/g++ 仅存在于 builder 阶段）。
+- 运行形态：运行身份由 compose 的 `user:` 指定（`WEBMAIL_UID`/`WEBMAIL_GID`，与宿主站点属主一致——VPS 上为 1002=ysy、本地缺省 1000；镜像内建用户 1001 仅是不覆盖时的缺省）；烘焙 `WEBMAIL_DATA_DIR=/data`、`WEBMAIL_HOST=0.0.0.0`；**不发布任何宿主端口**——只在 compose 网络内可达（信任边界 = 网络隔离 + 站点代理的 `isOwner` 守卫）。
+- 部署：compose 服务 `webmail`（`./webmail-data:/data`）；`deploy.yml` 每次构建推送 `ghcr.io/shaoyuanyu/webmail:latest`，VPS 拉取后 `docker compose up -d --no-deps web webmail`。
 
 ## 实现经验（实测踩过的）
 
