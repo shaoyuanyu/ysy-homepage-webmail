@@ -7,7 +7,7 @@ import type { AccountConfig, AccountCredential, SyncResult } from "./types.js";
 /** 标记回读窗口（3.5：收窄范围，全量重取会打爆服务商） */
 const FLAGS_WINDOW_DAYS = 90;
 /** 超过该大小的邮件只存元数据，原文不下载（红线 12：大附件一律按需） */
-const MAX_SOURCE_BYTES = Number(process.env.MAIL_MAX_SOURCE_BYTES ?? 50 * 1024 * 1024);
+const MAX_SOURCE_BYTES = Number(process.env.MAIL_AGENT_MAX_SOURCE_BYTES ?? 50 * 1024 * 1024);
 
 export async function syncFolder(
   db: Db,

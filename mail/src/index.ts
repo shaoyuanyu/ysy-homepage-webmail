@@ -16,13 +16,18 @@ import { WorkerPool } from "./worker.js";
 const dataDir = mailDataDir();
 const once = process.argv.includes("--once");
 
+/** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 MAIL_AGENT_HOST 覆盖（如 0.0.0.0） */
+const HOST = process.env.MAIL_AGENT_HOST ?? "127.0.0.1";
+/** worker 自连工具面的目标：监听 0.0.0.0 时回落回环（0.0.0.0 不是可连接的目标地址） */
+const SELF_HOST = HOST === "0.0.0.0" ? "127.0.0.1" : HOST;
+
 const db = openDb(join(dataDir, "mail.db"));
 const agentDb = openAgentDb(agentDbPath(dataDir));
 
 // 存量回填 refs_json / has_attach（4.7，幂等）
 backfillRefs(db, dataDir).then((r) => {
   if (r.updated || r.failed) {
-    console.log(`[maild] refs 回填：更新 ${r.updated} 行，失败 ${r.failed} 行`);
+    console.log(`[mailagentd] refs 回填：更新 ${r.updated} 行，失败 ${r.failed} 行`);
   }
 });
 const accounts = loadAccounts(dataDir).filter((a) => a.enabled);
@@ -47,7 +52,7 @@ function buildPool(
   if (!reportTo) throw new Error("accounts.json 没有非 agent 账号作为汇报收件人（reportTo）");
   return new WorkerPool({
     agentDb: adb,
-    mcpUrl: `http://127.0.0.1:${TOOLS_PORT}/mcp`,
+    mcpUrl: `http://${SELF_HOST}:${TOOLS_PORT}/mcp`,
     model: createModel(cfg),
     modelName: cfg.model,
     reportTo,
@@ -100,10 +105,10 @@ for (const account of accounts) {
 if (!once) {
   console.log("进入 IDLE 监听（Ctrl-C 退出）");
   const toolsServer = createToolsServer({ db, agentDb, dataDir, accounts, creds, caldav });
-  toolsServer.listen(TOOLS_PORT, "127.0.0.1", () => {
-    console.log(`受限工具面（MCP）已监听 127.0.0.1:${TOOLS_PORT}`);
+  toolsServer.listen(TOOLS_PORT, HOST, () => {
+    console.log(`受限工具面（MCP）已监听 ${HOST}:${TOOLS_PORT}`);
     if (pool && modelCfg) {
-      const concurrency = Number(process.env.MAILD_WORKER_CONCURRENCY ?? 3);
+      const concurrency = Number(process.env.MAIL_AGENT_WORKER_CONCURRENCY ?? 3);
       void pool.run(concurrency);
       console.log(`agent worker 池已启动（模型 ${modelCfg.model}，并发 ${concurrency}）`);
       startReportTimer(agentDb, pool, modelCfg.reportHour);

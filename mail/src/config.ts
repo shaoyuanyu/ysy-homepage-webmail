@@ -4,7 +4,7 @@ import type { AccountConfig, AccountsFile, CredentialsFile } from "./types.js";
 
 /** 邮件库根目录：accounts.json / credentials.json / mail.db / eml/ */
 export function mailDataDir(): string {
-  return process.env.MAIL_DATA_DIR ?? join(process.cwd(), "data", "mail");
+  return process.env.MAIL_AGENT_DATA_DIR ?? join(process.cwd(), "data", "mail");
 }
 
 export function loadAccounts(dir: string = mailDataDir()): AccountConfig[] {

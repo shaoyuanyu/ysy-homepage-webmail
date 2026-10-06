@@ -11,7 +11,7 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 | `src/write.ts` | IMAP 写操作：`setFlags`（`+FLAGS`/`-FLAGS`）、`detectSentFolder` / `detectTrashFolder`（`\Sent` / `\Trash` 探测）、`appendRaw`、`moveUid`、`deleteUid` |
 | `src/send.ts` | 发信：MailComposer 构造一次 → SMTP 与 `APPEND` 用同一份字节（红线 6）；先探测「已发送」再发信 |
 | `src/render.ts` | HTML 邮件渲染管线：sanitize-html + 远程内容白名单 + cid 重写 + style 里的 url() 剥除（4.4） |
-| `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接） |
+| `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`，`WEBMAIL_HOST` / `WEBMAIL_PORT` 可调）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接） |
 | `src/accounts.ts` | 账号增删（4.11）：`normalizeAccountInput` 纯校验/归一 + `testAccountConnection`（IMAP 登录 + SMTP verify）+ `addAccount` / `deleteAccount`（原子落盘、失败回滚） |
 | `src/contacts.ts` | 通讯录 CRUD + 自动收录（4.10）|
 | `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + API 常驻 |

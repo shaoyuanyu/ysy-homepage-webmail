@@ -9,7 +9,7 @@ import type { AccountConfig } from "./types.js";
 
 /**
  * `/mail/agent` 只读视图（MAIL-AGENT.md 第八节 第 5 步 / 4.3 / 4.5）：
- * 前端经 maild 的 `/agent/*` 端点读 agent 产物——只查库，无任何写路径。
+ * 前端经 mailagentd 的 `/agent/*` 端点读 agent 产物——只查库，无任何写路径。
  * - 时间线 = agent 账号全部副本合并（收 + 发），方向按 from 是否 agent 地址
  * - 详情展示原始邮件：原始头部块 + MIME 结构 + 附件 + text 正文（不渲染 HTML）
  * - 推理只在展开单封信时才拉（5.2），详情里只带计数

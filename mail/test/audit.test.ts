@@ -57,7 +57,7 @@ describe("源码审查：写调用的唯一落点（3.2 / 3.8）", () => {
   });
 
   it("agent worker 侧模块不 import 凭据 / IMAP / SMTP / 工具面服务端（5.3）", () => {
-    // worker 的工具调用一律经 MCP client 走 HTTP 自连：凭据只有一个落点（maild 主流程），
+    // worker 的工具调用一律经 MCP client 走 HTTP 自连：凭据只有一个落点（mailagentd 主流程），
     // 这条把「worker 不持有凭据」机器化。新增 worker 侧模块时必须把它加进清单。
     const workerSide = ["worker.ts", "judge.ts", "queue.ts", "auth.ts", "model.ts"];
     const forbidden = [
@@ -72,7 +72,7 @@ describe("源码审查：写调用的唯一落点（3.2 / 3.8）", () => {
       "db", // mail.db 原始索引（worker 读邮件只能经 read_message）
       "mcp", // 工具面服务端
       "tools", // 工具面分发（绕过 HTTP 就绕过了台账的唯一入口语义）
-      "trigger", // 触发接线（maild 侧，持有 mail.db 与原文）
+      "trigger", // 触发接线（mailagentd 侧，持有 mail.db 与原文）
     ];
     for (const file of workerSide) {
       const entry = sources.find((s) => s.file === file);

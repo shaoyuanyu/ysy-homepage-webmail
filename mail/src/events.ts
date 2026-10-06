@@ -58,7 +58,7 @@ export function buildEventIcs(uid: string, ev: EventInput): string {
   const lines = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
-    "PRODID:-//maild//agent-schedule//CN",
+    "PRODID:-//mailagentd//agent-schedule//CN",
     "BEGIN:VEVENT",
     `UID:${uid}`,
     `DTSTAMP:${toIcsUtc(new Date().toISOString())}`,

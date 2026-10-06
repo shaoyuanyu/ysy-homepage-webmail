@@ -6,7 +6,7 @@ import type { AccountConfig } from "./types.js";
  * 表现都是抓取失败但没有报错），这里把运行状态显式化，由 /agent/health 暴露给
  * /mail 页面的常驻状态条（告警通道不依赖邮件——凭据失效时邮件通道自己也坏了）。
  *
- * maild 是独立长驻进程，模块级单例即可（主站 Next.js 那套「模块逐请求重求值」
+ * mailagentd 是独立长驻进程，模块级单例即可（主站 Next.js 那套「模块逐请求重求值」
  * 的陷阱不适用于本进程）。
  */
 
@@ -54,9 +54,9 @@ export function markFailure(accountId: string, err: unknown): void {
   s.lastError = err instanceof Error ? err.message : String(err);
 }
 
-/** 告警阈值：连续 N 次抓取失败产生告警（默认 3，可用 MAILD_ALERT_FAILURES 覆盖） */
+/** 告警阈值：连续 N 次抓取失败产生告警（默认 3，可用 MAIL_AGENT_ALERT_FAILURES 覆盖） */
 export function alertThreshold(): number {
-  const n = Number(process.env.MAILD_ALERT_FAILURES ?? 3);
+  const n = Number(process.env.MAIL_AGENT_ALERT_FAILURES ?? 3);
   return Number.isInteger(n) && n >= 1 ? n : 3;
 }
 

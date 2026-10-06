@@ -17,7 +17,7 @@ import {
 
 /**
  * 工具面 HTTP 服务（5.3）：MCP over streamable HTTP + 给前端/人工的 JSON 端点。
- * 绑 127.0.0.1、不做认证（与 webmaild 同一信任边界）。
+ * 默认绑 127.0.0.1（MAIL_AGENT_HOST 可调）、不做认证（与 webmaild 同一信任边界）。
  * - POST /mcp                          MCP 工具面（无状态，每请求一个 transport）
  * - GET  /health                       存活
  * - GET  /ledger?limit=&beforeId=      台账只读视图（前端台账页签用）
@@ -42,7 +42,7 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 function buildMcpServer(ctx: ToolsContext): McpServer {
-  const server = new McpServer({ name: "maild", version: "0.1.0" });
+  const server = new McpServer({ name: "mailagentd", version: "0.1.0" });
   for (const tool of TOOLS) {
     server.registerTool(
       tool.name,
@@ -97,7 +97,7 @@ export function createToolsServer(ctx: ToolsContext): Server {
       // ---- /agent/* 只读视图（第 5 步；4.5：前端读 agent 导出的只读视图，无写路径）----
       // 台账/待确认在 /agent 下再挂一份：前端只跟 /agent/* 打交道（站点代理一条通路）
 
-      // 站主自己的地址（4.10 通讯录「我的账号」用）：maild 注册表里的全部账号（含 agent@）。
+      // 站主自己的地址（4.10 通讯录「我的账号」用）：mailagentd 注册表里的全部账号（含 agent@）。
       // ⚠ 只出 id / 显示名 / 地址 / isAgent / enabled —— 主机、端口、文件夹、凭据一律不出门。
       if (req.method === "GET" && url.pathname === "/agent/accounts") {
         return sendJson(res, 200, {
@@ -219,4 +219,4 @@ function numOpt(v: string | null): number | undefined {
   return v ? Number(v) : undefined;
 }
 
-export const TOOLS_PORT = Number(process.env.MAILD_TOOLS_PORT ?? 9711);
+export const TOOLS_PORT = Number(process.env.MAIL_AGENT_TOOLS_PORT ?? 9711);

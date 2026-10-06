@@ -87,7 +87,7 @@ afterAll(() => {
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
 });
 
-describe("maild 抓取与索引", () => {
+describe("mailagentd 抓取与索引", () => {
   it("首轮同步入库，且全程不改动 \\Seen（PEEK 常驻断言）", async () => {
     const before = await readAllFlags();
     expect(before.size).toBe(3);

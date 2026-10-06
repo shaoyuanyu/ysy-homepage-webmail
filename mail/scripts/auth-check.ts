@@ -11,7 +11,7 @@ import { authenticateCommand } from "../src/auth.js";
  *   --dns：注入公共 DNS resolver（223.5.5.5 / 119.29.29.29），排查本机 DNS 代理干扰
  */
 
-const dataDir = process.env.MAIL_DATA_DIR ?? "data/mail";
+const dataDir = process.env.MAIL_AGENT_DATA_DIR ?? "data/mail";
 const accounts = loadAccounts(dataDir);
 
 const useDns = process.argv.includes("--dns");

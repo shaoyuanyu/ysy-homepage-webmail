@@ -80,7 +80,7 @@ afterAll(async () => {
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
 });
 
-describe("maild IDLE 监听", () => {
+describe("mailagentd IDLE 监听", () => {
   it("启动后先补抓存量邮件", async () => {
     await waitFor("SELECT COUNT(*) AS n FROM messages", 1);
   });

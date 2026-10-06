@@ -96,20 +96,20 @@ describe("健康监控（5.5）", () => {
     expect(r.accounts[1].alert).toBe(true);
   });
 
-  it("alertThreshold：MAILD_ALERT_FAILURES 可覆盖，非法值回退 3", () => {
-    const orig = process.env.MAILD_ALERT_FAILURES;
+  it("alertThreshold：MAIL_AGENT_ALERT_FAILURES 可覆盖，非法值回退 3", () => {
+    const orig = process.env.MAIL_AGENT_ALERT_FAILURES;
     try {
-      delete process.env.MAILD_ALERT_FAILURES;
+      delete process.env.MAIL_AGENT_ALERT_FAILURES;
       expect(alertThreshold()).toBe(3);
-      process.env.MAILD_ALERT_FAILURES = "5";
+      process.env.MAIL_AGENT_ALERT_FAILURES = "5";
       expect(alertThreshold()).toBe(5);
-      process.env.MAILD_ALERT_FAILURES = "abc";
+      process.env.MAIL_AGENT_ALERT_FAILURES = "abc";
       expect(alertThreshold()).toBe(3);
-      process.env.MAILD_ALERT_FAILURES = "0";
+      process.env.MAIL_AGENT_ALERT_FAILURES = "0";
       expect(alertThreshold()).toBe(3);
     } finally {
-      if (orig === undefined) delete process.env.MAILD_ALERT_FAILURES;
-      else process.env.MAILD_ALERT_FAILURES = orig;
+      if (orig === undefined) delete process.env.MAIL_AGENT_ALERT_FAILURES;
+      else process.env.MAIL_AGENT_ALERT_FAILURES = orig;
     }
   });
 });

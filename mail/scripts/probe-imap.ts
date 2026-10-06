@@ -8,10 +8,10 @@ import { loadAccounts, loadCredentials } from "../src/config.js";
  * - 服务能力：IDLE（5.1 唤醒方式）、THREAD（6.1 会话组装）、SPECIAL-USE（\Sent 探测，红线 5）
  * - 文件夹清单与 special-use 标志位
  * - 有 smtpHost 的账号做 SMTP auth 验证（verify 只握手不发信）
- * 凭据从 MAIL_DATA_DIR（缺省 ./data/mail）读取，不打印任何凭据。
+ * 凭据从 MAIL_AGENT_DATA_DIR（缺省 ./data/mail）读取，不打印任何凭据。
  */
 
-const dataDir = process.env.MAIL_DATA_DIR ?? "data/mail";
+const dataDir = process.env.MAIL_AGENT_DATA_DIR ?? "data/mail";
 const accounts = loadAccounts(dataDir).filter((a) => a.enabled);
 const creds = loadCredentials(dataDir);
 

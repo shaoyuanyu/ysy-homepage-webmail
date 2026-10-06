@@ -1,4 +1,4 @@
-# maild · 邮件抓取与索引 + 受限工具面
+# mailagentd · 邮件抓取与索引 + 受限工具面
 
 MAIL-AGENT.md 第八节第 1、3、4、5 步的实现。独立包、独立进程：agent 侧的邮件凭据只落在本进程（文档 5.3 第一条）。
 
@@ -21,13 +21,13 @@ MAIL-AGENT.md 第八节第 1、3、4、5 步的实现。独立包、独立进程
 | `src/events.ts` | `create_event`：写主站 CalDAV `agent-schedule` 集合（Radicale MKCOL/PUT，ICS 手工构造 + RFC 5545 转义折行） |
 | `src/reader.ts` | `read_message` / `get_attachment`：本地索引 + `.eml` 组装详情（eml_path 相对 dataDir，读取必须拼） |
 | `src/tools.ts` | 8 个固定工具的定义与 `callTool` 分发（每次调用先落台账，成功/失败都记） |
-| `src/mcp.ts` | 工具面 HTTP 服务：`POST /mcp`（MCP streamable HTTP，无状态）+ `GET /health` `/ledger` `/pending-sends` + `POST /pending-sends/:id/confirm|discard` + `/agent/*` 只读视图（第 5 步），绑 `127.0.0.1:9711`（`MAILD_TOOLS_PORT` 可调） |
+| `src/mcp.ts` | 工具面 HTTP 服务：`POST /mcp`（MCP streamable HTTP，无状态）+ `GET /health` `/ledger` `/pending-sends` + `POST /pending-sends/:id/confirm|discard` + `/agent/*` 只读视图（第 5 步），绑 `127.0.0.1:9711`（`MAIL_AGENT_HOST` / `MAIL_AGENT_TOOLS_PORT` 可调） |
 | `src/agentview.ts` | `/agent/*` 只读视图的查询逻辑（第 5 步）：timeline / message 详情 / .eml / rfc822 展开 / judgments / reasoning——只查 mail.db + agent.db，无写路径 |
 | `src/index.ts` | 入口：`--once` 单轮同步；无参数进入 IDLE 常驻并挂起工具面 |
 
 ## 数据目录
 
-`MAIL_DATA_DIR`（缺省 `cwd/data/mail`）：
+`MAIL_AGENT_DATA_DIR`（缺省 `cwd/data/mail`）：
 
 ```
 accounts.json      账号注册表（id/显示名/地址/服务商/颜色/IMAP 主机端口/文件夹白名单/启用；
@@ -35,7 +35,7 @@ accounts.json      账号注册表（id/显示名/地址/服务商/颜色/IMAP �
 credentials.json   凭据（按账号 id 索引；caldav 键存 Radicale 用户名密码；chmod 600，勿入库）
 mail.db            SQLite 索引（WAL）——纯原始邮件索引
 agent.db           工具层/模型产物库（台账 + 待确认队列 + tasks 任务队列 + judgment/reasoning）
-eml/               原文留存（sha1(message_id).eml；超 50MB 只存元数据，MAIL_MAX_SOURCE_BYTES 可调）
+eml/               原文留存（sha1(message_id).eml；超 50MB 只存元数据，MAIL_AGENT_MAX_SOURCE_BYTES 可调）
 ```
 
 ## 受限工具面（第 3 步）
@@ -51,7 +51,7 @@ agent 只能调这 8 个工具——**没有删除、移动、EXPUNGE 的函数*
 
 ## agent worker 池与产物（第 4 步）
 
-- **worker 池在 maild 进程内**（并发缺省 3，`MAILD_WORKER_CONCURRENCY` 可调），但**工具调用一律经 MCP client 走 HTTP 自连**（`127.0.0.1:9711`）：worker 侧模块（`worker/judge/model/queue`）不 import 凭据/IMAP/SMTP，audit 测试扫 import 清单锁定，将来拆独立容器零代码改动。
+- **worker 池在 mailagentd 进程内**（并发缺省 3，`MAIL_AGENT_WORKER_CONCURRENCY` 可调），但**工具调用一律经 MCP client 走 HTTP 自连**（`127.0.0.1:9711`）：worker 侧模块（`worker/judge/model/queue`）不 import 凭据/IMAP/SMTP，audit 测试扫 import 清单锁定，将来拆独立容器零代码改动。
 - **任务队列 = `agent.db` 的 `tasks` 表**：原子领取靠一条 `UPDATE ... WHERE id = (SELECT ... ORDER BY priority DESC, id LIMIT 1) RETURNING`（better-sqlite3 同步 API 单进程天然串行）；失败指数退避 `run_after`（2^attempts 分钟），3 次后标 `failed`。
 - **触发接线（`trigger.ts`）**：入库新邮件 → 指令认证 → 投任务。**只处理 `created = true` 的邮件**（多副本重复入库不重复投，指令邮件尤其不能执行两次）。
 - **指令认证（`auth.ts`，3.6）**：From 在白名单（注册表里除 agent 外的账号地址）+ SPF/DKIM **双双通过**（mailauth 自验，`trustReceived: true` 从 Received 链取第一跳验 SPF），不依赖服务商的 `Authentication-Results`；认证异常一律按普通邮件处理（宁可误判为 judge）。`resolver` 可注入 DNS 解析器，测试离线可跑。
@@ -103,12 +103,8 @@ pnpm typecheck
 - **judge（3 条）**：结构化判定 + 推理文本 + token 数；模型不给推理时 reasoningText 为 null（两种文本分开存）；judgment 重判覆盖、reasoning 只追加。
 - **model（4 条）**：model 段 + apiKey 齐备才返回配置、reportHour 缺省 21、baseURL 尾斜杠归一、`createModel` 不发请求。
 - **worker（4 条，真实 Dovecot + MCP 自连 + MockLanguageModel）**：judge 全链路（read_message 经 MCP → judgment/reasoning 落库 + 台账）、judge 出 event 写 CalDAV、command 多轮工具调用 + 回执发给指令来源、report 汇总 + 待确认提醒发 reportTo。
-- **agentview（8 条）**：时间线收发合并与方向、游标分页；详情的原始头部/结构/text 正文（无渲染产物）；.eml 原件字节逐字一致（CRLF 保留）；rfc822 就地展开（含 HTML 的 inner 只给纯文本、远程 <img> 不在返回里）；rfc822 越界与非 rfc822 附件 404；索引外与「只在别的账号有副本」均 404；judgments 关联 subject/from、reasoning - **thread（7 条）**：Message-ID 规范化（去尖括号/小写/补 `mid:` 前缀）、References
-/In-Reply-To 引用链拼合、不动点扩展、带引号精确匹配防误命中、ingest 回填 refs_j
-son 与存量 backfill。
-- **health（7 条，5.5）**：连续失败计数达阈值（默认 3，`MAILD_ALERT_FAILURES` 可覆
-盖）进入告警态、成功抓取记录 lastOk 并清除 lastError、连接成功清零失败计数、任一
-账号告警则整体 `ok=false`。
+- **agentview（8 条）**：时间线收发合并与方向、游标分页；详情的原始头部/结构/text 正文（无渲染产物）；.eml 原件字节逐字一致（CRLF 保留）；rfc822 就地展开（含 HTML 的 inner 只给纯文本、远程 <img> 不在返回里）；rfc822 越界与非 rfc822 附件 404；索引外与「只在别的账号有副本」均 404；judgments 关联 subject/from、reasoning - **thread（7 条）**：Message-ID 规范化（去尖括号/小写/补 `mid:` 前缀）、References/In-Reply-To 引用链拼合、不动点扩展、带引号精确匹配防误命中、ingest 回填 refs_json 与存量 backfill。
+- **health（7 条，5.5）**：连续失败计数达阈值（默认 3，`MAIL_AGENT_ALERT_FAILURES` 可覆盖）进入告警态、成功抓取记录 lastOk 并清除 lastError、连接成功清零失败计数、任一账号告警则整体 `ok=false`。
 
 容器约定：不挂 maildir 卷（rootless 下 userns 映射会让 dovecot 起不来），投放走 IMAP `APPEND`，重建 UIDVALIDITY 走 `exec rm -rf /srv/mail/<user>`。dovecot 的 UIDVALIDITY 是秒级时间戳，重建后须跨秒再投放。发信用例需要 `Sent` 的 special_use 标志位（`startDovecot(name, { specialUse: true })`）。SMTP 接收端复用 `webmail/test/smtp-sink.ts`（smtp-server 内存桩）。**宿主端口必须预先抢占固定（`pickFreePort`），勿用 `-p 127.0.0.1::143` 的随机分配**——docker 在 restart 时会为宿主端口 0 的映射重新随机分配（podman 不会），UIDVALIDITY 用例 restart 后拿着旧端口必 ECONNREFUSED（第 4 步实测踩中，白等 90s waitReady 超时）。
 

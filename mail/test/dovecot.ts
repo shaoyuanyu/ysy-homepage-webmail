@@ -64,7 +64,7 @@ function pickFreePort(): number {
 }
 
 export function startDovecot(suffix: string, opts: { specialUse?: boolean } = {}): DovecotHandle {
-  const name = `maild-test-${suffix}-${process.pid}`;
+  const name = `mailagentd-test-${suffix}-${process.pid}`;
   execSync(`${CONTAINER_BIN} rm -f ${name} >/dev/null 2>&1 || true`);
 
   const dir = join(workRoot, `dovecot-${suffix}`);

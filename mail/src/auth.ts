@@ -6,8 +6,8 @@ import type { AccountConfig } from "./types.js";
  * 指令认证（3.6，2026-10 修订）：按来信通道分两路——
  * · 域内直投（顶层 Received 是阿里云提交服务章 `by smtp.aliyun-inc.com`）：From 在白名单即指令。
  *   域内投递要求 SMTP 认证提交，外部伪造由本域 SPF `-all` 在 MX 门口硬拒；下游结构性不可验（不签 DKIM）。
- * · 外部来信：From 在白名单 + SPF 与 DKIM 双双通过（maild 自验，不依赖服务商的 Authentication-Results）。
- * 认证在投任务前完成（maild 侧，持有原文）；结果记台账。
+ * · 外部来信：From 在白名单 + SPF 与 DKIM 双双通过（mailagentd 自验，不依赖服务商的 Authentication-Results）。
+ * 认证在投任务前完成（mailagentd 侧，持有原文）；结果记台账。
  */
 
 export interface CommandAuthResult {

@@ -6,6 +6,8 @@ import { loadAccounts, loadCredentials, webmailDataDir } from "./config.js";
 import { MIRROR_SWEEP_MS, mirrorDrafts } from "./draft-mirror.js";
 
 const PORT = Number(process.env.WEBMAIL_PORT ?? 9710);
+/** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 WEBMAIL_HOST 覆盖（如 0.0.0.0） */
+const HOST = process.env.WEBMAIL_HOST ?? "127.0.0.1";
 const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 60_000);
 
 async function main() {
@@ -45,8 +47,8 @@ async function main() {
   }, MIRROR_SWEEP_MS);
 
   const server = createApiServer(ctx);
-  server.listen(PORT, "127.0.0.1", () => {
-    console.log(`[webmaild] API 监听 127.0.0.1:${PORT}，数据目录 ${dataDir}`);
+  server.listen(PORT, HOST, () => {
+    console.log(`[webmaild] API 监听 ${HOST}:${PORT}，数据目录 ${dataDir}`);
   });
 
   const shutdown = () => {
