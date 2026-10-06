@@ -44,14 +44,15 @@ for (const account of accounts) {
 
     const boxes = await client.list();
     for (const b of boxes) {
-      // 服务端不支持 SPECIAL-USE 时 imapflow 不返回该字段
-      const attrs = b.specialUseAttribs ? [...b.specialUseAttribs] : [];
+      // 服务端不支持 SPECIAL-USE 时 imapflow 不返回该字段（类型定义未收录，运行时存在）
+      const attrs = (b as { specialUseAttribs?: string[] }).specialUseAttribs ?? [];
       console.log(`  文件夹 ${b.path}${attrs.length ? `  [${attrs.join(" ")}]` : ""}`);
     }
 
     const lock = await client.getMailboxLock("INBOX", { readOnly: true });
     try {
-      console.log(`INBOX：exists=${client.mailbox?.exists ?? "?"}`);
+      const mb = client.mailbox;
+      console.log(`INBOX：exists=${mb ? mb.exists : "?"}`);
     } finally {
       lock.release();
     }

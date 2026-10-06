@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { healthReport } from "./health.js";
 import { callTool, TOOLS, type ToolsContext } from "./tools.js";
 import { listLedger, listPendingSends } from "./ledger.js";
 import { confirmPendingSend, discardPendingSend } from "./send.js";
@@ -24,6 +25,7 @@ import {
  * - POST /pending-sends/:id/confirm    确认发出（人操作；不进 MCP，agent 不能给自己开闸）
  * - POST /pending-sends/:id/discard    丢弃
  * - GET  /agent/*                      `/mail/agent` 只读视图（第 5 步）：timeline/message/eml/rfc822/judgments/reasoning
+ * - GET  /agent/health                 健康监控（5.5）：每账号上次成功抓取 / 连续失败 / 连接状态
  */
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -94,6 +96,24 @@ export function createToolsServer(ctx: ToolsContext): Server {
 
       // ---- /agent/* 只读视图（第 5 步；4.5：前端读 agent 导出的只读视图，无写路径）----
       // 台账/待确认在 /agent 下再挂一份：前端只跟 /agent/* 打交道（站点代理一条通路）
+
+      // 站主自己的地址（4.10 通讯录「我的账号」用）：maild 注册表里的全部账号（含 agent@）。
+      // ⚠ 只出 id / 显示名 / 地址 / isAgent / enabled —— 主机、端口、文件夹、凭据一律不出门。
+      if (req.method === "GET" && url.pathname === "/agent/accounts") {
+        return sendJson(res, 200, {
+          items: ctx.accounts.map((a) => ({
+            id: a.id,
+            displayName: a.displayName,
+            email: a.email,
+            isAgent: a.isAgent === true,
+            enabled: a.enabled !== false,
+          })),
+        });
+      }
+      // 健康监控（5.5）：每账号上次成功抓取 / 连续失败 / 连接状态，/mail 常驻状态条用
+      if (req.method === "GET" && url.pathname === "/agent/health") {
+        return sendJson(res, 200, healthReport(ctx.accounts));
+      }
       if (req.method === "GET" && url.pathname === "/agent/ledger") {
         const limit = url.searchParams.get("limit");
         const beforeId = url.searchParams.get("beforeId");

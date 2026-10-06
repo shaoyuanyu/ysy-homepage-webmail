@@ -19,7 +19,8 @@ const resolver = useDns
   ? (() => {
       const r = new dns.promises.Resolver();
       r.setServers(["223.5.5.5", "119.29.29.29"]);
-      return (name: string, type: string) => r.resolve(name, type as never) as Promise<string[][]>;
+      // dns.resolve 的重载返回 AnyRecord 联合，与 mailauth 的 resolver 签名不直接兼容
+      return (name: string, type: string) => r.resolve(name, type as never) as unknown as Promise<string[][]>;
     })()
   : undefined;
 

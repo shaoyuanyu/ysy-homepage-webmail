@@ -140,4 +140,40 @@ describe("webmaild 写操作", () => {
     await api("/delete", { copies: [{ accountId: "acc2", folder: "Trash", uid: trashUid }] });
     expect((await readAllFlags(dovecot, "test2", "test2", "Trash")).size).toBe(0);
   });
+
+  it("一键已读（/mark-all-read）：按账号范围清未读，跨账号副本一起写", async () => {
+    // 布局：02 → acc1+acc2 各一份（跨账号副本）；03 → 仅 acc1；04 → 仅 acc2
+    await deliverFixtures(dovecot, "test", "test", ["02.eml", "03.eml"]);
+    await deliverFixtures(dovecot, "test2", "test2", ["02.eml", "04.eml"]);
+    await api("/sync");
+    // ⚠ 上一段用例移动走的 mid:w01 副本仍在 acc1 的 Trash 里（sync 会重新索引到它，
+    //   状态是已读）——下面断言只数「未见」条数，不数总条数，避免被它干扰
+    expect((await listIds()).filter((i) => !i.seen).length).toBe(3);
+
+    // 范围 = acc1：02（acc1 有副本）+ 03 被标；02 在 acc2 的副本也必须一起写
+    // （消息级已读 = 所有副本都 Seen，红线 8）；04 不在范围、保持未读
+    const scoped = (await (
+      await api("/mark-all-read", { accounts: ["acc1"] })
+    ).json()) as { updated: number; messages: number; skipped: unknown[] };
+    expect(scoped.messages).toBe(2);
+    expect(scoped.updated).toBe(3); // 02×2 副本 + 03×1 副本
+    expect(scoped.skipped).toEqual([]);
+
+    const acc1Flags = await readAllFlags(dovecot, "test", "test", "INBOX");
+    expect([...acc1Flags.values()].every((f) => f.includes("\\Seen"))).toBe(true);
+    const acc2Flags = await readAllFlags(dovecot, "test2", "test2", "INBOX");
+    expect([...acc2Flags.values()].filter((f) => !f.includes("\\Seen")).length).toBe(1); // 只剩 04
+    // 本地索引同步：只剩 1 封未读（04）
+    const stillUnseen = (await listIds()).filter((i) => !i.seen);
+    expect(stillUnseen.length).toBe(1);
+
+    // 不传 accounts = 全部账号：剩下的 04 也被标
+    const all = (await (await api("/mark-all-read", {})).json()) as {
+      updated: number;
+      messages: number;
+    };
+    expect(all.messages).toBe(1);
+    expect(all.updated).toBe(1);
+    expect((await listIds()).filter((i) => !i.seen).length).toBe(0);
+  });
 });

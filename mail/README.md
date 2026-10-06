@@ -84,7 +84,7 @@ pnpm test                         # 测试（集成用例需要容器：CONTAINE
 pnpm typecheck
 ```
 
-## 测试（77 条，test/）
+## 测试（104 条，test/）
 
 集成用例对真实 Dovecot 容器断言，本机用 rootless podman（`CONTAINER_BIN=podman`），CI 用 docker：
 
@@ -97,13 +97,18 @@ pnpm typecheck
 - **flags（4 条）**：多副本一起写、前值/后值落台账、`\Answered` 不受影响、索引外消息与空 change 拒绝。
 - **send（7 条）**：白名单直发且 SMTP 与留底字节一致；白名单外进队列、确认原样发出、丢弃永不发出、重复处理拒绝；cc 外发同样触发闸门；找不到「已发送」拒发且 SMTP 不发出。
 - **events（6 条）**：ICS 构造（UTC 化、转义、缺省 end）、MKCOL 建集合路径、PUT 失败落失败台账。
-- **tools（10 条）**：MCP `tools/list` 恰好 8 个工具、无凭据字段泄漏、search→read 链路、宽容归一、失败调用落台账、`/ledger` `/pending-sends` `/health` 形状、confirm 对不存在 id 的报错、未知端点 404。
-- **auth（7 条）**：白名单不含 agent 自己；SPF/DKIM 双过才是指令；From 不在白名单/SPF 伪造/缺 DKIM/签名后篡改正文都不是指令；DNS 全灭按普通邮件处理。
+- **tools（12 条）**：MCP `tools/list` 恰好 8 个工具、无凭据字段泄漏、search→read 链路、宽容归一、失败调用落台账、`/ledger` `/pending-sends` `/health` 形状、confirm 对不存在 id 的报错、未知端点 404。
+- **auth（18 条）**：白名单不含 agent 自己；SPF/DKIM 双过才是指令；From 不在白名单/SPF 伪造/缺 DKIM/签名后篡改正文都不是指令；DNS 全灭按普通邮件处理。
 - **queue（5 条）**：领取顺序 command > report > judge、`run_after` 未到期不领、领取置 running 且 attempts+1、失败退避重投三次后 failed、计数汇总。
 - **judge（3 条）**：结构化判定 + 推理文本 + token 数；模型不给推理时 reasoningText 为 null（两种文本分开存）；judgment 重判覆盖、reasoning 只追加。
 - **model（4 条）**：model 段 + apiKey 齐备才返回配置、reportHour 缺省 21、baseURL 尾斜杠归一、`createModel` 不发请求。
 - **worker（4 条，真实 Dovecot + MCP 自连 + MockLanguageModel）**：judge 全链路（read_message 经 MCP → judgment/reasoning 落库 + 台账）、judge 出 event 写 CalDAV、command 多轮工具调用 + 回执发给指令来源、report 汇总 + 待确认提醒发 reportTo。
-- **agentview（8 条）**：时间线收发合并与方向、游标分页；详情的原始头部/结构/text 正文（无渲染产物）；.eml 原件字节逐字一致（CRLF 保留）；rfc822 就地展开（含 HTML 的 inner 只给纯文本、远程 <img> 不在返回里）；rfc822 越界与非 rfc822 附件 404；索引外与「只在别的账号有副本」均 404；judgments 关联 subject/from、reasoning 按需拉取且 trace/summary 分开。
+- **agentview（8 条）**：时间线收发合并与方向、游标分页；详情的原始头部/结构/text 正文（无渲染产物）；.eml 原件字节逐字一致（CRLF 保留）；rfc822 就地展开（含 HTML 的 inner 只给纯文本、远程 <img> 不在返回里）；rfc822 越界与非 rfc822 附件 404；索引外与「只在别的账号有副本」均 404；judgments 关联 subject/from、reasoning - **thread（7 条）**：Message-ID 规范化（去尖括号/小写/补 `mid:` 前缀）、References
+/In-Reply-To 引用链拼合、不动点扩展、带引号精确匹配防误命中、ingest 回填 refs_j
+son 与存量 backfill。
+- **health（7 条，5.5）**：连续失败计数达阈值（默认 3，`MAILD_ALERT_FAILURES` 可覆
+盖）进入告警态、成功抓取记录 lastOk 并清除 lastError、连接成功清零失败计数、任一
+账号告警则整体 `ok=false`。
 
 容器约定：不挂 maildir 卷（rootless 下 userns 映射会让 dovecot 起不来），投放走 IMAP `APPEND`，重建 UIDVALIDITY 走 `exec rm -rf /srv/mail/<user>`。dovecot 的 UIDVALIDITY 是秒级时间戳，重建后须跨秒再投放。发信用例需要 `Sent` 的 special_use 标志位（`startDovecot(name, { specialUse: true })`）。SMTP 接收端复用 `webmail/test/smtp-sink.ts`（smtp-server 内存桩）。**宿主端口必须预先抢占固定（`pickFreePort`），勿用 `-p 127.0.0.1::143` 的随机分配**——docker 在 restart 时会为宿主端口 0 的映射重新随机分配（podman 不会），UIDVALIDITY 用例 restart 后拿着旧端口必 ECONNREFUSED（第 4 步实测踩中，白等 90s waitReady 超时）。
 

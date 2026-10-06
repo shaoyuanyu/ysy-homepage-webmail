@@ -213,6 +213,50 @@ describe("工具面的非 MCP JSON 端点", () => {
     expect(root.tools.length).toBe(8);
   });
 
+  it("GET /agent/health：每账号同步健康（5.5），连续失败达阈值后告警", async () => {
+    const { markConnected, markFailure, markSyncOk } = await import("../src/health.js");
+    // 工具面 server 自己不做抓取，这里模拟一轮「连接成功 + 抓取成功」
+    markConnected("test");
+    markSyncOk("test");
+    const healthy = (await (
+      await fetch(`http://127.0.0.1:${port}/agent/health`)
+    ).json()) as {
+      ok: boolean;
+      threshold: number;
+      accounts: {
+        id: string;
+        displayName: string;
+        email: string;
+        lastOk: string | null;
+        failures: number;
+        connected: boolean;
+        alert: boolean;
+      }[];
+    };
+    expect(healthy.ok).toBe(true);
+    expect(healthy.threshold).toBe(3);
+    expect(healthy.accounts).toHaveLength(1);
+    expect(healthy.accounts[0]).toMatchObject({
+      id: "test",
+      email: "test@local",
+      failures: 0,
+      connected: true,
+      alert: false,
+    });
+    expect(healthy.accounts[0].lastOk).not.toBeNull();
+    // ⚠ 主机、端口、文件夹、凭据不出现在健康视图里（与 /agent/accounts 同一红线）
+    expect(JSON.stringify(healthy.accounts[0])).not.toMatch(/imapHost|smtpHost|password|folders/);
+
+    // 连续失败达到阈值 → 告警态（用例末尾恢复，避免污染其它用例）
+    for (let i = 0; i < 3; i++) markFailure("test", new Error("boom"));
+    const alerting = (await (
+      await fetch(`http://127.0.0.1:${port}/agent/health`)
+    ).json()) as { ok: boolean; accounts: { alert: boolean; failures: number }[] };
+    expect(alerting.ok).toBe(false);
+    expect(alerting.accounts[0]).toMatchObject({ alert: true, failures: 3 });
+    markConnected("test");
+  });
+
   it("GET /ledger 分页形状与 /pending-sends", async () => {
     const ledger = (await (
       await fetch(`http://127.0.0.1:${port}/ledger?limit=5`)
@@ -227,6 +271,22 @@ describe("工具面的非 MCP JSON 端点", () => {
       await fetch(`http://127.0.0.1:${port}/pending-sends`)
     ).json()) as { items: unknown[] };
     expect(pending.items).toEqual([]);
+  });
+
+  it("GET /agent/accounts：只出 id/显示名/地址/isAgent/enabled，主机与凭据不出门", async () => {
+    const body = (await (
+      await fetch(`http://127.0.0.1:${port}/agent/accounts`)
+    ).json()) as { items: Record<string, unknown>[] };
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]).toEqual({
+      id: "test",
+      displayName: "Test",
+      email: "test@local",
+      isAgent: false,
+      enabled: true,
+    });
+    // 邮件主机/端口/文件夹（以及任何凭据）一律不得出现在响应里
+    expect(JSON.stringify(body)).not.toMatch(/imapHost|imapPort|smtp|folders|password|username/i);
   });
 
   it("confirm/discard 不存在的 id 报错；未知端点 404", async () => {

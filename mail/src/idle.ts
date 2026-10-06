@@ -1,5 +1,6 @@
 import type { ImapFlow } from "imapflow";
 import type { Db } from "./db.js";
+import { markConnected, markFailure, markSyncOk } from "./health.js";
 import { connectAccount } from "./imap.js";
 import { syncAccount } from "./fetcher.js";
 import type { AccountConfig, AccountCredential, SyncResult } from "./types.js";
@@ -30,10 +31,12 @@ export async function watchAccount(
     try {
       client = await connectAccount(account, cred);
       failures = 0;
+      markConnected(account.id);
       await idleLoop(db, dataDir, client, account, cred, signal, onSynced);
     } catch (err) {
       if (signal?.aborted) return;
       failures++;
+      markFailure(account.id, err);
       const wait = Math.min(2 ** failures * 1000, 300_000);
       console.error(`[${account.id}] 连接中断，${wait / 1000}s 后重连（第 ${failures} 次）`, err);
       await sleep(wait);
@@ -62,6 +65,7 @@ async function idleLoop(
     syncing = true;
     try {
       const results = await syncAccount(db, dataDir, account, cred, client);
+      markSyncOk(account.id);
       for (const r of results) {
         if (r.fetched > 0) {
           console.log(`[${r.accountId}] ${r.folder}: +${r.fetched} 封`);

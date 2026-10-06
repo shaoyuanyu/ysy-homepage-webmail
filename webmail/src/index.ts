@@ -1,7 +1,9 @@
 import { join } from "node:path";
 import { openDb } from "../../mail/src/db.js";
+import { backfillRefs } from "../../mail/src/message.js";
 import { createApiServer, runSync, type WebmailContext } from "./api.js";
 import { loadAccounts, loadCredentials, webmailDataDir } from "./config.js";
+import { MIRROR_SWEEP_MS, mirrorDrafts } from "./draft-mirror.js";
 
 const PORT = Number(process.env.WEBMAIL_PORT ?? 9710);
 const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 60_000);
@@ -12,6 +14,13 @@ async function main() {
   const credentialsFile = loadCredentials(dataDir);
   const credentials = new Map(Object.entries(credentialsFile));
   const db = openDb(join(dataDir, "webmail.db"));
+
+  // 存量回填 refs_json / has_attach（4.7，幂等，不阻塞 API 起来）
+  backfillRefs(db, dataDir).then((r) => {
+    if (r.updated || r.failed) {
+      console.log(`[webmaild] refs 回填：更新 ${r.updated} 行，失败 ${r.failed} 行`);
+    }
+  });
 
   const ctx: WebmailContext = {
     db,
@@ -29,6 +38,12 @@ async function main() {
     runSync(ctx).catch((err) => console.error("[webmaild] 定时同步失败：", err));
   }, SYNC_INTERVAL_MS);
 
+  // 草稿 → 服务器「草稿」文件夹镜像（2026-10-06，见 draft-mirror.ts）：
+  // 每 4 秒扫一次，只投递「安静满 10 秒」的 dirty 草稿（合并连续自动保存）
+  const draftTimer = setInterval(() => {
+    mirrorDrafts(ctx).catch((err) => console.error("[webmaild] 草稿镜像失败：", err));
+  }, MIRROR_SWEEP_MS);
+
   const server = createApiServer(ctx);
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`[webmaild] API 监听 127.0.0.1:${PORT}，数据目录 ${dataDir}`);
@@ -36,6 +51,7 @@ async function main() {
 
   const shutdown = () => {
     clearInterval(timer);
+    clearInterval(draftTimer);
     server.close();
     process.exit(0);
   };

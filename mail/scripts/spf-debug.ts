@@ -17,7 +17,8 @@ for (const name of ["mail.shaoyuanyu.cn", "spf.qiye.aliyun.com", "shaoyuanyu.cn"
 }
 
 const eml = readFileSync(process.argv[2] ?? "data/mail/eml/8964e2173d5d31a505a73cd6bbe9ab4125f0f27c.eml");
-const resolve = (name: string, type: string) => resolver.resolve(name, type as never) as Promise<string[][]>;
+const resolve = (name: string, type: string) => resolver.resolve(name, type as never) as unknown as Promise<string[][]>;
 const r = await authenticate(eml, { trustReceived: true, resolver: resolve });
 console.log("spf 完整状态：", JSON.stringify(r.spf, null, 1));
-console.log("sender/ip：", JSON.stringify(r.status, null, 1));
+// mailauth 从 Received 链解析出的第一跳（sender/ip 的实际来源）
+console.log("第一跳（receivedChain[0]）：", JSON.stringify(r.receivedChain?.[0] ?? null, null, 1));

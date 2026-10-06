@@ -6,11 +6,27 @@ import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
 import { syncAccount } from "../../mail/src/fetcher.js";
 import { searchMessages } from "../../mail/src/search.js";
+import { threadMessageIds } from "../../mail/src/thread.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import type { CopyRef, FlagChange, SendInput, WebmailAccount } from "./types.js";
+import {
+  ContactError,
+  contactNameMap,
+  createContact,
+  deleteContact,
+  findContactByEmail,
+  listContacts,
+  listKnownSendersExcluding,
+  suggestContacts,
+  updateContact,
+} from "./contacts.js";
+import { AccountError, addAccount, deleteAccount, setRemoteImageDomains, updateAccount, type AddAccountInput, type UpdateAccountInput } from "./accounts.js";
+import { deleteServerDraftCopy, readDraftServerRef } from "./draft-mirror.js";
+import { createDraft, deleteDraft, listDrafts, updateDraft, type DraftInput } from "./drafts.js";
+import { withAccountLock } from "./locks.js";
 import { renderMailHtml } from "./render.js";
 import { sendMessage } from "./send.js";
-import { deleteUid, moveUid, setFlags } from "./write.js";
+import { deleteUid, isSentFolderName, moveUid, SENT_FOLDER_NAMES, setFlags, setSeenBatch } from "./write.js";
 
 /** 前端代理前缀：cid 内联附件重写到这个前缀下（webmaild 自身只绑回环） */
 const PUBLIC_PREFIX = process.env.WEBMAIL_PUBLIC_PREFIX ?? "/api/mail";
@@ -20,6 +36,8 @@ const MAX_BODY_BYTES = 40 * 1024 * 1024;
 export interface SyncState {
   lastSync: string | null;
   lastError: string | null;
+  /** 上次本轮同步实际抓进新邮件的时刻（fetched > 0 才刷新）；安静期保持不变 */
+  lastNewMail: string | null;
 }
 
 export interface WebmailContext {
@@ -50,24 +68,12 @@ interface MessageRow {
   size: number;
   truncated: number;
   eml_path: string;
+  refs_json: string | null;
+  has_attach: number;
 }
 
-/** 红线 10：同一账号的 IMAP 操作串行（同步与写操作共用一把锁，不会并发开第二条连接） */
-const accountLocks = new Map<string, Promise<void>>();
-
-async function withAccountLock<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = accountLocks.get(accountId) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((r) => (release = r));
-  accountLocks.set(accountId, prev.then(() => gate));
-  await prev;
-  try {
-    return await fn();
-  } finally {
-    release();
-    if (accountLocks.get(accountId) === gate) accountLocks.delete(accountId);
-  }
-}
+// 红线 10（同一账号的 IMAP 操作串行）的锁在 locks.ts——新增草稿镜像模块后，
+// api 与 draft-mirror 都要用它，放这里会形成循环 import
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -101,7 +107,7 @@ function messageOf(ctx: WebmailContext, messageId: string): MessageRow | undefin
     .get(messageId) as MessageRow | undefined;
 }
 
-function listItem(ctx: WebmailContext, row: MessageRow) {
+function listItem(ctx: WebmailContext, row: MessageRow, names?: Map<string, string>) {
   const copies = copiesOf(ctx, row.message_id);
   const seen = copies.length > 0 && copies.every((c) => c.flags.split(" ").includes("\\Seen"));
   const flagged = copies.some((c) => c.flags.split(" ").includes("\\Flagged"));
@@ -110,39 +116,107 @@ function listItem(ctx: WebmailContext, row: MessageRow) {
     date: row.date,
     subject: row.subject ?? "",
     fromAddr: row.from_addr ?? "",
-    fromName: row.from_name ?? "",
+    // 通讯录里存过该发件人时，优先显示通讯录里的名字
+    fromName: names?.get((row.from_addr ?? "").toLowerCase()) ?? row.from_name ?? "",
+    // 收件人列表：列表行对发件邮件显示「发给 X」（4.9），详情页的 To 行也用它
+    to: JSON.parse(row.to_json) as { name?: string; address?: string }[],
     snippet: row.snippet,
     size: row.size,
     truncated: row.truncated === 1,
     seen,
     flagged,
+    hasAttach: row.has_attach === 1,
     copies: copies.map((c) => ({ accountId: c.account_id, folder: c.folder, uid: c.uid })),
     accounts: [...new Set(copies.map((c) => c.account_id))],
   };
 }
 
-/** 合并视图：跨账号按时间倒序，游标（date, messageId）分页 */
+/** 标记匹配统一用「两侧补空格后整词匹配」，避免 `\Seen` 被子串误伤（与 listItem 的 split 口径一致） */
+const HAS_SEEN_SQL = "instr(' ' || c.flags || ' ', ' \\Seen ') > 0";
+const HAS_FLAGGED_SQL = "instr(' ' || c.flags || ' ', ' \\Flagged ') > 0";
+
+/**
+ * 状态 / 方向筛选（4.2、4.9），两个维度互相独立、可组合：
+ * - `filter`（状态）：逗号分隔多值（2026-10-04 起）——`unseen` = 存在任一副本无 `\Seen`；
+ *   `flagged` = 存在任一副本有 `\Flagged`。多值取交集（`unseen,flagged` = 未读且加星，
+ *   前端「星标」视图 + 「未读」开关需要这种组合）；单值写法不变。
+ * - `direction`（方向）：`received` = 存在 INBOX 副本（收到的）；`sent` = 副本**全部**在
+ *   「已发送」类文件夹（我发出的）
+ *
+ * ⚠ `sent` 的口径必须与前端 `isSentItem`（`lib/mail/kind.ts`）完全一致，
+ * 否则会出现「筛出来不对」的矛盾；两边共用同一份文件夹名名单（各持一份，改动同步）。
+ */
+function matchFilter(
+  ctx: WebmailContext,
+  messageId: string,
+  filter: string | null,
+  direction: string | null,
+): boolean {
+  const filters = new Set((filter ?? "").split(",").filter(Boolean));
+  if (!filters.size && !direction) return true;
+  const copies = copiesOf(ctx, messageId);
+  if (filters.has("unseen") && !copies.some((c) => !c.flags.split(" ").includes("\\Seen"))) return false;
+  if (filters.has("flagged") && !copies.some((c) => c.flags.split(" ").includes("\\Flagged"))) return false;
+  if (direction === "received" && !copies.some((c) => c.folder.trim().toUpperCase() === "INBOX")) return false;
+  if (direction === "sent" && !(copies.length > 0 && copies.every((c) => isSentFolderName(c.folder)))) return false;
+  return true;
+}
+
+/**
+ * 合并视图：跨账号按时间倒序，游标（date, messageId）分页。
+ * `account` 支持逗号分隔多值（2026-10-05 起，多选账号筛选取**并集**；单值写法不变）。
+ */
 function listMessages(ctx: WebmailContext, url: URL) {
-  const account = url.searchParams.get("account");
+  const accountIds = (url.searchParams.get("account") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const q = url.searchParams.get("q")?.trim();
   const before = url.searchParams.get("before");
+  const filter = url.searchParams.get("filter");
+  const direction = url.searchParams.get("direction");
   const limit = Math.min(Number(url.searchParams.get("limit") ?? 50) || 50, 200);
+  const names = contactNameMap(ctx.db);
 
   if (q) {
     const hits = searchMessages(ctx.db, q, limit);
     const items = hits
       .map((h) => messageOf(ctx, h.messageId))
       .filter((r): r is MessageRow => !!r)
-      .filter((r) => !account || copiesOf(ctx, r.message_id).some((c) => c.account_id === account))
-      .map((r) => listItem(ctx, r));
+      .filter(
+        (r) =>
+          !accountIds.length ||
+          copiesOf(ctx, r.message_id).some((c) => accountIds.includes(c.account_id)),
+      )
+      .filter((r) => matchFilter(ctx, r.message_id, filter, direction))
+      .map((r) => listItem(ctx, r, names));
     return { items, next: null };
   }
 
   const params: unknown[] = [];
   let where = "1=1";
-  if (account) {
-    where += " AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND c.account_id = ?)";
-    params.push(account);
+  if (accountIds.length) {
+    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND c.account_id IN (${accountIds.map(() => "?").join(", ")}))`;
+    params.push(...accountIds);
+  }
+  // filter 支持逗号分隔多值（交集语义，与 matchFilter 的 JS 路径同口径）
+  const filters = new Set((filter ?? "").split(",").filter(Boolean));
+  if (filters.has("unseen")) {
+    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND NOT ${HAS_SEEN_SQL})`;
+  }
+  if (filters.has("flagged")) {
+    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND ${HAS_FLAGGED_SQL})`;
+  }
+  if (direction === "received") {
+    where += " AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND upper(trim(c.folder)) = 'INBOX')";
+  } else if (direction === "sent") {
+    // 副本全在「已发送」类文件夹：至少有一个副本，且不存在任何不在名单内的副本
+    // （⚠ 与 matchFilter 的 JS 路径同口径；SQLite 的 lower/upper 只处理 ASCII，
+    //   中文文件夹名不受影响——名字本来就无大小写）
+    const placeholders = SENT_FOLDER_NAMES.map(() => "?").join(", ");
+    where += " AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id)";
+    where += ` AND NOT EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND lower(trim(c.folder)) NOT IN (${placeholders}))`;
+    params.push(...SENT_FOLDER_NAMES.map((n) => n.toLowerCase()));
   }
   if (before) {
     const sep = before.indexOf("|");
@@ -156,13 +230,20 @@ function listMessages(ctx: WebmailContext, url: URL) {
   const page = rows.slice(0, limit);
   const last = page.at(-1);
   const next = rows.length > limit && last?.date ? `${last.date}|${last.message_id}` : null;
-  return { items: page.map((r) => listItem(ctx, r)), next };
+  return { items: page.map((r) => listItem(ctx, r, names)), next };
 }
 
 async function messageDetail(ctx: WebmailContext, messageId: string) {
   const row = messageOf(ctx, messageId);
   if (!row) return null;
-  const base = { ...listItem(ctx, row), to: JSON.parse(row.to_json), cc: JSON.parse(row.cc_json) };
+  const base = {
+    ...listItem(ctx, row, contactNameMap(ctx.db)),
+    cc: JSON.parse(row.cc_json),
+    // 引用链（4.7）：回复时带上，自己发出的信才能继续挂进会话
+    refs: JSON.parse(row.refs_json ?? "[]") as string[],
+    // 发件人是否已在通讯录（详情页「存入通讯录」按钮态）
+    fromContactId: row.from_addr ? (findContactByEmail(ctx.db, row.from_addr)?.id ?? null) : null,
+  };
   if (!row.eml_path) {
     return { ...base, text: "", html: "", attachments: [], remoteBlocked: 0 };
   }
@@ -249,6 +330,88 @@ async function applyFlags(ctx: WebmailContext, messageId: string, change: FlagCh
   return { updated: copies.length };
 }
 
+/**
+ * 批量标已读（2026-10-05，供 /mail 的「全部标为已读」）：
+ * 把**范围内可见的未读消息**的每个缺 \Seen 副本补上 \Seen。
+ *
+ * 口径与列表一致：「消息级未读」= 存在任一副本缺 \Seen（`listItem.seen` / `filter=unseen`
+ * 的 EXISTS 口径）——要让它变成已读，就把每个缺 \Seen 的副本都写上（含范围外账号的
+ * 副本，与单条 `applyFlags` 的「所有副本一起写」同一条红线 8）。
+ *
+ * 范围 = `accountIds`（空 = 全部账号）：只计入「至少有一个副本落在这些账号里」的消息。
+ * 方向 / 搜索 / 星标不参与——未读本质是收件箱概念，「全部已读」按账号范围清最为直觉。
+ *
+ * 性能：所选副本按账号分组、账号内再按文件夹分组，**每文件夹一次 STORE**（见 setSeenBatch），
+ * 每账号一次连接。单账号失败只记 skipped，不阻断其它账号（与批量写操作的整体风格一致）。
+ */
+async function markAllRead(ctx: WebmailContext, accountIds: string[]) {
+  const params: unknown[] = [];
+  let scope = "";
+  if (accountIds.length) {
+    scope = ` AND EXISTS (SELECT 1 FROM copies cs WHERE cs.message_id = c.message_id AND cs.account_id IN (${accountIds.map(() => "?").join(", ")}))`;
+    params.push(...accountIds);
+  }
+  const rows = ctx.db
+    .prepare(
+      `SELECT c.account_id, c.folder, c.uid, c.message_id FROM copies c
+       WHERE instr(' ' || c.flags || ' ', ' \\Seen ') = 0${scope}`,
+    )
+    .all(...params) as { account_id: string; folder: string; uid: number; message_id: string }[];
+
+  const result: { updated: number; messages: number; skipped: { account: string; folder: string; uid: number; reason: string }[] } = {
+    updated: 0,
+    messages: new Set(rows.map((r) => r.message_id)).size,
+    skipped: [],
+  };
+
+  const byAccount = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const list = byAccount.get(r.account_id) ?? [];
+    list.push(r);
+    byAccount.set(r.account_id, list);
+  }
+
+  for (const [accountId, list] of byAccount) {
+    const account = ctx.accounts.get(accountId);
+    const cred = ctx.credentials.get(accountId);
+    if (!account || !cred) {
+      result.skipped.push(...list.map((r) => ({ account: accountId, folder: r.folder, uid: r.uid, reason: "账号或凭据缺失" })));
+      continue;
+    }
+    await withAccountLock(accountId, async () => {
+      const client = await connectAccount(account, cred);
+      try {
+        const byFolder = new Map<string, number[]>();
+        for (const r of list) {
+          const uids = byFolder.get(r.folder) ?? [];
+          uids.push(r.uid);
+          byFolder.set(r.folder, uids);
+        }
+        for (const [folder, uids] of byFolder) {
+          try {
+            await setSeenBatch(client, folder, uids);
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            result.skipped.push(...uids.map((uid) => ({ account: accountId, folder, uid, reason })));
+            continue;
+          }
+          // 服务端写成功后更新本地索引（与服务端一致的「加 \Seen」语义）
+          const upd = ctx.db.prepare(
+            "UPDATE copies SET flags = trim(flags || ' \\Seen') WHERE account_id = ? AND folder = ? AND uid = ?",
+          );
+          for (const uid of uids) {
+            upd.run(accountId, folder, uid);
+            result.updated++;
+          }
+        }
+      } finally {
+        await client.logout().catch(() => {});
+      }
+    });
+  }
+  return result;
+}
+
 /** 移动 / 删除：按账号分组逐条执行，成功后本地副本行按「源位置已不存在」处理 */
 async function applyCopiesOp(
   ctx: WebmailContext,
@@ -312,13 +475,27 @@ async function runSync(ctx: WebmailContext, onlyAccount?: string) {
     if (onlyAccount && account.id !== onlyAccount) continue;
     const cred = ctx.credentials.get(account.id);
     if (!cred) throw new Error(`账号 ${account.id} 缺少凭据`);
-    const state: SyncState = ctx.syncStates.get(account.id) ?? { lastSync: null, lastError: null };
+    const state: SyncState = ctx.syncStates.get(account.id) ?? { lastSync: null, lastError: null, lastNewMail: null };
     try {
       const r = await withAccountLock(account.id, () =>
         syncAccount(ctx.db, ctx.dataDir, account, cred)
       );
-      state.lastSync = new Date().toISOString();
+      const now = new Date().toISOString();
+      state.lastSync = now;
       state.lastError = null;
+      // 本轮确实抓进新邮件才刷新 lastNewMail——「上次收到新邮件」的语义，
+      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）
+      if (r.some((x) => x.fetched > 0)) state.lastNewMail = now;
+      // 进程重启后内存态丢失：用库里最新一封的日期兜底初始化，
+      // 否则重启后要干等下一封新邮件才显示得出时间
+      if (!state.lastNewMail) {
+        const row = ctx.db
+          .prepare(
+            "SELECT MAX(m.date) AS d FROM messages m JOIN copies c ON c.message_id = m.message_id WHERE c.account_id = ?"
+          )
+          .get(account.id) as { d: string | null };
+        state.lastNewMail = row.d ?? null;
+      }
       results.push(r);
     } catch (err) {
       state.lastError = err instanceof Error ? err.message : String(err);
@@ -342,12 +519,16 @@ export function createApiServer(ctx: WebmailContext): Server {
           accounts: [...ctx.accounts.values()].map((a) => ({
             id: a.id,
             enabled: a.enabled,
-            ...(ctx.syncStates.get(a.id) ?? { lastSync: null, lastError: null }),
+            ...(ctx.syncStates.get(a.id) ?? { lastSync: null, lastError: null, lastNewMail: null }),
           })),
         });
       }
 
       if (req.method === "GET" && path === "/accounts") {
+        // 未读数口径（4.2）：只算 INBOX 中无 \Seen 的副本——「已发送」等文件夹不计
+        const unreadStmt = ctx.db.prepare(
+          `SELECT COUNT(*) AS n FROM copies c WHERE c.account_id = ? AND c.folder = 'INBOX' AND NOT ${HAS_SEEN_SQL}`
+        );
         return json(
           res,
           200,
@@ -359,8 +540,44 @@ export function createApiServer(ctx: WebmailContext): Server {
             color: a.color,
             folders: a.folders,
             enabled: a.enabled,
+            // 发件人姓名（随邮件发出的 From 显示名；与备注名 displayName 区分，2026-10-06）
+            senderName: a.senderName ?? "",
+            // 连接字段（账号管理弹窗的编辑表单预填；**不含密码**，密码只写不读）
+            imapHost: a.imapHost,
+            imapPort: a.imapPort,
+            imapSecure: a.imapSecure,
+            smtpHost: a.smtpHost,
+            smtpPort: a.smtpPort,
+            smtpSecure: a.smtpSecure,
+            username: ctx.credentials.get(a.id)?.username ?? "",
+            unread: (unreadStmt.get(a.id) as { n: number }).n,
           }))
         );
+      }
+
+      // 新增账号：先连接测试（IMAP 登录 + SMTP verify）通过才落盘
+      if (req.method === "POST" && path === "/accounts") {
+        const body = (await readBody(req)) as AddAccountInput;
+        return json(res, 201, await addAccount(ctx, body));
+      }
+
+      // 远程图片白名单（4.4）：全局设置，账号管理弹窗里维护；写后即时生效
+      if (req.method === "GET" && path === "/remote-image-domains") {
+        return json(res, 200, { domains: ctx.remoteImageDomains });
+      }
+      if (req.method === "PUT" && path === "/remote-image-domains") {
+        const body = (await readBody(req)) as { domains?: unknown } | undefined;
+        return json(res, 200, setRemoteImageDomains(ctx, body?.domains));
+      }
+
+      const accountMatch = path.match(/^\/accounts\/([^/]+)$/);
+      if (accountMatch && req.method === "DELETE") {
+        return json(res, 200, deleteAccount(ctx, decodeURIComponent(accountMatch[1])));
+      }
+      // 修改账号（2026-10-06）：备注名 / 发件人姓名 / 连接字段；连接字段变了先做连接测试
+      if (accountMatch && req.method === "PUT") {
+        const body = (await readBody(req)) as UpdateAccountInput;
+        return json(res, 200, await updateAccount(ctx, decodeURIComponent(accountMatch[1]), body));
       }
 
       if (req.method === "GET" && path === "/messages") {
@@ -372,6 +589,18 @@ export function createApiServer(ctx: WebmailContext): Server {
         const detail = await messageDetail(ctx, decodeURIComponent(msgMatch[1]));
         if (!detail) return json(res, 404, { error: "消息不存在" });
         return json(res, 200, detail);
+      }
+
+      const threadMatch = path.match(/^\/message\/([^/]+)\/thread$/);
+      if (req.method === "GET" && threadMatch) {
+        const id = decodeURIComponent(threadMatch[1]);
+        if (!messageOf(ctx, id)) return json(res, 404, { error: "消息不存在" });
+        const names = contactNameMap(ctx.db);
+        const items = threadMessageIds(ctx.db, id)
+          .map((mid) => messageOf(ctx, mid))
+          .filter((r): r is MessageRow => !!r)
+          .map((r) => listItem(ctx, r, names));
+        return json(res, 200, { current: id, items });
       }
 
       const attMatch = path.match(/^\/message\/([^/]+)\/attachment\/(\d+)$/);
@@ -391,6 +620,18 @@ export function createApiServer(ctx: WebmailContext): Server {
         const cred = ctx.credentials.get(input.accountId);
         if (!account || !cred) return json(res, 400, { error: `账号未配置：${input.accountId}` });
         const result = await withAccountLock(account.id, () => sendMessage(account, cred, input));
+        // 来自草稿的发送：成功后删除该草稿（幂等；失败不拦——发送已成功）。
+        // 服务器镜像副本同步清理（2026-10-06）：先读位置再删本地行；清理失败只记日志
+        // （草稿已发出，不能因为清理失败而报错；阿里云侧最多留一个手动可删的副本）。
+        if (input.draftId) {
+          const ref = readDraftServerRef(ctx.db, input.draftId);
+          deleteDraft(ctx.db, input.draftId);
+          if (ref && ref.uid !== null) {
+            deleteServerDraftCopy(ctx, ref).catch((err) =>
+              console.error("[webmaild] 发送后清理服务器草稿副本失败：", err instanceof Error ? err.message : err)
+            );
+          }
+        }
         return json(res, 200, result);
       }
 
@@ -403,6 +644,14 @@ export function createApiServer(ctx: WebmailContext): Server {
         return json(res, 200, await applyFlags(ctx, body.messageId, body));
       }
 
+      if (req.method === "POST" && path === "/mark-all-read") {
+        const body = (await readBody(req)) as { accounts?: unknown };
+        const accounts = Array.isArray(body.accounts)
+          ? body.accounts.filter((a): a is string => typeof a === "string" && a.length > 0)
+          : [];
+        return json(res, 200, await markAllRead(ctx, accounts));
+      }
+
       if (req.method === "POST" && (path === "/move" || path === "/delete")) {
         const body = (await readBody(req)) as { copies?: CopyRef[]; to?: string };
         if (!Array.isArray(body.copies) || body.copies.length === 0) {
@@ -412,6 +661,79 @@ export function createApiServer(ctx: WebmailContext): Server {
         return json(res, 200, await applyCopiesOp(ctx, body.copies, op, body.to));
       }
 
+      if (req.method === "GET" && path === "/contacts") {
+        const q = url.searchParams.get("q")?.trim() ?? "";
+        return json(res, 200, { items: listContacts(ctx.db, q) });
+      }
+
+      // ---- 草稿（2026-10-06）：写信页自动保存 / 草稿箱 ----
+      // 列表（按最近更新倒序）：写信页据此找回同一原信 / 新建的最新草稿
+      if (req.method === "GET" && path === "/drafts") {
+        return json(res, 200, { items: listDrafts(ctx.db) });
+      }
+      if (req.method === "POST" && path === "/drafts") {
+        const body = (await readBody(req)) as DraftInput;
+        return json(res, 201, createDraft(ctx.db, body ?? {}));
+      }
+      const draftMatch = path.match(/^\/drafts\/([^/]+)$/);
+      if (draftMatch && req.method === "PUT") {
+        const body = (await readBody(req)) as DraftInput;
+        const updated = updateDraft(ctx.db, decodeURIComponent(draftMatch[1]), body ?? {});
+        if (!updated) return json(res, 404, { error: "草稿不存在" });
+        return json(res, 200, updated);
+      }
+      if (draftMatch && req.method === "DELETE") {
+        const id = decodeURIComponent(draftMatch[1]);
+        // 服务器镜像副本先删（2026-10-06）：本地删掉后就没地方查 UID 了。
+        // 真失败（网络/认证）→ 502 且**保留本地草稿**（用户可重试，两端不出现
+        // 「本地没了、阿里云还在」的漂移）；uidvalidity 变化（邮箱被重建、不能按
+        // 旧 UID 安全删）与从未投递过不算失败，照常删本地。
+        const ref = readDraftServerRef(ctx.db, id);
+        if (ref) {
+          const r = await deleteServerDraftCopy(ctx, ref);
+          if (!r.deleted && r.reason !== "never-mirrored" && r.reason !== "uidvalidity" && r.reason !== "account-missing") {
+            return json(res, 502, { error: `服务器草稿删除失败：${r.reason ?? "未知"}` });
+          }
+        }
+        deleteDraft(ctx.db, id);
+        return json(res, 200, { ok: true });
+      }
+
+      // 自动收录：通信过但未保存进通讯录的地址（按频次排序，排除自己各账号）
+      if (req.method === "GET" && path === "/contacts/known") {
+        const own = new Set([...ctx.accounts.values()].map((a) => a.email.toLowerCase()));
+        const items = listKnownSendersExcluding(ctx.db, own, {
+          q: url.searchParams.get("q") ?? "",
+          limit: Number(url.searchParams.get("limit") ?? 50) || 50,
+        });
+        return json(res, 200, { items });
+      }
+
+      // 写信自动补全：已保存联系人在前，自动收录在后
+      if (req.method === "GET" && path === "/contacts/suggest") {
+        const own = new Set([...ctx.accounts.values()].map((a) => a.email.toLowerCase()));
+        return json(res, 200, suggestContacts(ctx.db, own, url.searchParams.get("q") ?? ""));
+      }
+
+      if (req.method === "POST" && path === "/contacts") {
+        const body = (await readBody(req)) as { name?: string; email?: string; note?: string; account?: string };
+        if (!body.email?.trim()) return json(res, 400, { error: "缺少 email" });
+        return json(res, 201, createContact(ctx.db, { name: body.name, email: body.email, note: body.note, account: body.account }));
+      }
+
+      const contactMatch = path.match(/^\/contacts\/([^/]+)$/);
+      if (contactMatch && req.method === "PATCH") {
+        const body = (await readBody(req)) as { name?: string; email?: string; note?: string; account?: string };
+        const updated = updateContact(ctx.db, decodeURIComponent(contactMatch[1]), body);
+        if (!updated) return json(res, 404, { error: "联系人不存在" });
+        return json(res, 200, updated);
+      }
+      if (contactMatch && req.method === "DELETE") {
+        const removed = deleteContact(ctx.db, decodeURIComponent(contactMatch[1]));
+        if (!removed) return json(res, 404, { error: "联系人不存在" });
+        return json(res, 200, { ok: true });
+      }
+
       if (req.method === "POST" && path === "/sync") {
         const body = (await readBody(req)) as { accountId?: string };
         return json(res, 200, await runSync(ctx, body.accountId));
@@ -419,6 +741,8 @@ export function createApiServer(ctx: WebmailContext): Server {
 
       return json(res, 404, { error: `未知端点：${req.method} ${path}` });
     } catch (err) {
+      if (err instanceof ContactError) return json(res, err.status, { error: err.message });
+      if (err instanceof AccountError) return json(res, err.status, { error: err.message });
       const message = err instanceof Error ? err.message : String(err);
       return json(res, 500, { error: message });
     }

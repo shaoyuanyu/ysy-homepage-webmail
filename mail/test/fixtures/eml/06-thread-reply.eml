@@ -1,0 +1,12 @@
+From: a@b.c
+To: hr@example.com
+Subject: Re: Thread root
+Date: Fri, 25 Sep 2026 15:00:00 +0800
+Message-ID: <t06@test.local>
+In-Reply-To: <t05@test.local>
+References: <t05@test.local>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+reply body

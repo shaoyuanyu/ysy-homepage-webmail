@@ -1,0 +1,12 @@
+From: test@local
+To: alice@example.com
+Subject: Re: Project kickoff
+Date: Fri, 25 Sep 2026 15:00:00 +0800
+Message-ID: <w06@test.local>
+In-Reply-To: <w05@test.local>
+References: <w05@test.local>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Looks good, see you there.

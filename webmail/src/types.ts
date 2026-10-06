@@ -5,6 +5,13 @@ export interface WebmailAccount extends AccountConfig {
   smtpHost: string;
   smtpPort: number;
   smtpSecure: boolean;
+  /**
+   * 发件人姓名（2026-10-06 用户定稿）：随邮件发出的 From 显示名。
+   * ⚠ 与 `displayName`（本地备注名，仅站内 UI 显示）**是两个字段**——备注名绝不会
+   * 出现在外发邮件里（曾把「我」当发件人姓名发出去，用户报障）；留空 = From 只带
+   * 邮箱地址，不带名字。
+   */
+  senderName?: string;
 }
 
 export interface WebmailAccountsFile {
@@ -29,7 +36,11 @@ export interface SendInput {
   html?: string;
   inReplyTo?: string;
   references?: string[];
+  /** 请求已读回执（MDN）：写 Disposition-Notification-To 头 */
+  readReceipt?: boolean;
   attachments?: SendAttachment[];
+  /** 来自草稿的发送：成功后删除该草稿（写信页的服务器端草稿，见 drafts.ts） */
+  draftId?: string;
 }
 
 export interface SendResult {

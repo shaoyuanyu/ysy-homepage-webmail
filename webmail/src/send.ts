@@ -38,7 +38,10 @@ export async function sendMessage(
   const messageId = `<${Date.now()}.${randomBytes(12).toString("hex")}@${domain}>`;
 
   const composer = new MailComposer({
-    from: account.displayName ? `"${account.displayName}" <${account.email}>` : account.email,
+    // From 的显示名用 senderName（发件人姓名，随邮件对外）——**不是** displayName
+    // （本地备注名，仅站内 UI 用；2026-10-06 用户报障：备注名「我」被当成发件人姓名
+    // 发出）。senderName 为空 = From 只有邮箱地址，不带名字。
+    from: account.senderName ? `"${account.senderName}" <${account.email}>` : account.email,
     to: input.to.join(", "),
     cc: input.cc?.join(", "),
     bcc: input.bcc?.join(", "),
@@ -47,6 +50,10 @@ export async function sendMessage(
     html: input.html,
     inReplyTo: input.inReplyTo,
     references: input.references,
+    // 已读回执请求（MDN，RFC 8098）：只写裸地址（displayName 可能含非 ASCII，
+    // 自定义头不会做 MIME 编码）；Bcc 由 MailComposer 默认从头部剔除（keepBcc=false），
+    // 仅进 SMTP envelope，不泄露给收件人
+    headers: input.readReceipt ? { "Disposition-Notification-To": account.email } : undefined,
     messageId,
     attachments: (input.attachments ?? []).map((a) => ({
       filename: a.filename,

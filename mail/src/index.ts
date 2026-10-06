@@ -2,9 +2,11 @@ import { join } from "node:path";
 import { loadAccounts, loadCaldav, loadCredentials, loadModel, mailDataDir } from "./config.js";
 import { openDb } from "./db.js";
 import { syncAccount } from "./fetcher.js";
+import { markSyncOk } from "./health.js";
 import { watchAccount } from "./idle.js";
 import { agentDbPath, openAgentDb, type AgentDb } from "./ledger.js";
 import { createToolsServer, TOOLS_PORT } from "./mcp.js";
+import { backfillRefs } from "./message.js";
 import { createModel } from "./model.js";
 import { enqueueTask } from "./queue.js";
 import { enqueueForIngested } from "./trigger.js";
@@ -16,6 +18,13 @@ const once = process.argv.includes("--once");
 
 const db = openDb(join(dataDir, "mail.db"));
 const agentDb = openAgentDb(agentDbPath(dataDir));
+
+// 存量回填 refs_json / has_attach（4.7，幂等）
+backfillRefs(db, dataDir).then((r) => {
+  if (r.updated || r.failed) {
+    console.log(`[maild] refs 回填：更新 ${r.updated} 行，失败 ${r.failed} 行`);
+  }
+});
 const accounts = loadAccounts(dataDir).filter((a) => a.enabled);
 const creds = loadCredentials(dataDir);
 const caldav = loadCaldav(dataDir);
@@ -79,6 +88,7 @@ for (const account of accounts) {
     throw new Error(`credentials.json 缺少账号 ${account.id} 的凭据`);
   }
   const results = await syncAccount(db, dataDir, account, cred);
+  markSyncOk(account.id);
   for (const r of results) {
     console.log(
       `[${r.accountId}] ${r.folder}: +${r.fetched} 封, 标记更新 ${r.flagsUpdated}${r.rebuilt ? ", 已重建" : ""}`

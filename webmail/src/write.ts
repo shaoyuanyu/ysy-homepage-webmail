@@ -34,14 +34,63 @@ export async function setFlags(
   }
 }
 
+/**
+ * 批量补 \Seen（2026-10-05，「一键已读」用）：一次 STORE 写一组 UID。
+ * 与 `setFlags` 同一红线（只 +FLAGS、绝不整体替换；一律 `{ uid: true }`）——
+ * 「把一批未读标成已读」只需要加标记，不需要按 UID 逐个往返。
+ * 调用方保证 uids 来自本地索引（copies 表），且已按文件夹分组。
+ */
+export async function setSeenBatch(
+  client: ImapFlow,
+  folder: string,
+  uids: number[]
+): Promise<void> {
+  if (uids.length === 0) return;
+  await openReadWrite(client, folder);
+  await client.messageFlagsAdd(uids.join(","), ["\\Seen"], { uid: true });
+}
+
+/**
+ * 「已发送」类文件夹的回退候选名（服务器没给 `\Sent` special-use 时的兜底，RFC 6154 之外）。
+ *
+ * ⚠ **与前端 `lib/mail/kind.ts` 的 `SENT_FOLDER_NAMES` 必须保持一致**（两边各一份，
+ * 因为 webmail 是独立包、不能与主站互 import）：前端据它判断列表行显示发件人还是
+ * 「发给 X」、webmaild 据它做 `direction=sent` 筛选——两处规则一旦不同，就会出现
+ * 「筛出来显示不对」这类自相矛盾（2026-10-04 加方向筛选时两边对齐，含 Sent Messages）。
+ */
+export const SENT_FOLDER_NAMES = [
+  "Sent",
+  "Sent Items",
+  "Sent Messages",
+  "已发送邮件",
+  "已发送",
+];
+
+/** 某个文件夹名是否属于「已发送」类（大小写不敏感；供 `direction=sent` 与前端判定复用） */
+export function isSentFolderName(folder: string): boolean {
+  const f = folder.trim().toLowerCase();
+  return SENT_FOLDER_NAMES.some((n) => n.toLowerCase() === f);
+}
+
 /** 「已发送」文件夹探测：优先 \Sent 特殊用途标志位（RFC 6154），回退常见名；找不到返回 null */
 export async function detectSentFolder(client: ImapFlow): Promise<string | null> {
-  return detectSpecialFolder(client, "\\Sent", ["Sent", "Sent Items", "已发送邮件", "已发送"]);
+  return detectSpecialFolder(client, "\\Sent", SENT_FOLDER_NAMES);
 }
 
 /** 「回收站」文件夹探测：同上，删除时优先移入 */
 export async function detectTrashFolder(client: ImapFlow): Promise<string | null> {
   return detectSpecialFolder(client, "\\Trash", ["Trash", "Deleted Items", "已删除邮件", "已删除"]);
+}
+
+/**
+ * 「草稿」文件夹的回退候选名（服务器没给 `\Drafts` special-use 时的兜底）。
+ * 阿里企业邮实测给 `\Drafts`（草稿），此列表只作保险。
+ */
+export const DRAFTS_FOLDER_NAMES = ["Drafts", "Draft", "草稿", "草稿箱", "已草稿"];
+
+/** 「草稿」文件夹探测：优先 \Drafts 特殊用途标志位（RFC 6154），回退常见名；找不到返回 null */
+export async function detectDraftsFolder(client: ImapFlow): Promise<string | null> {
+  return detectSpecialFolder(client, "\\Drafts", DRAFTS_FOLDER_NAMES);
 }
 
 async function detectSpecialFolder(

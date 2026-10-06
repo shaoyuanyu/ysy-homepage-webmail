@@ -113,6 +113,66 @@ describe("webmaild 发信", () => {
       expect(body.error).toContain("非法地址");
       expect(sink.received.length).toBe(before);
     });
+
+    it("发件人姓名：From 用 senderName（非备注名），清空后只发地址；带 draftId 发送后草稿被删", async () => {
+      // 备注名是「测试一」；把发件人姓名设为 Shaoyuan Yu
+      const put = await fetch(`${base}/accounts/acc1`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ senderName: "Shaoyuan Yu" }),
+      });
+      expect(put.status).toBe(200);
+      const summary = (await put.json()) as { displayName: string; senderName: string };
+      expect(summary.displayName).toBe("测试一"); // 备注名不变
+      expect(summary.senderName).toBe("Shaoyuan Yu");
+
+      // 建一封草稿 → 发送时带 draftId
+      const draft = (await (
+        await fetch(`${base}/drafts`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind: "new", accountId: "acc1", subject: "带名字" }),
+        })
+      ).json()) as { id: string };
+
+      const before = sink.received.length;
+      const res = await fetch(`${base}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: "acc1",
+          to: ["friend@example.org"],
+          subject: "带名字",
+          text: "x",
+          draftId: draft.id,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const parsed = await simpleParser(sink.received[before]);
+      expect(parsed.from?.value[0]?.name).toBe("Shaoyuan Yu");
+      expect(parsed.from?.value[0]?.address).toBe("test@local");
+
+      // 发送成功后草稿被删除（幂等清理）
+      const drafts = (await (await fetch(`${base}/drafts`)).json()) as { items: { id: string }[] };
+      expect(drafts.items.some((d) => d.id === draft.id)).toBe(false);
+
+      // 清空发件人姓名 → From 不带名字（**不回落成备注名**）
+      const cleared = await fetch(`${base}/accounts/acc1`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ senderName: "" }),
+      });
+      expect(cleared.status).toBe(200);
+      const before2 = sink.received.length;
+      await fetch(`${base}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ accountId: "acc1", to: ["friend2@example.org"], subject: "无名字", text: "y" }),
+      });
+      const parsed2 = await simpleParser(sink.received[before2]);
+      expect(parsed2.from?.value[0]?.name).toBe("");
+      expect(parsed2.from?.value[0]?.address).toBe("test@local");
+    });
   });
 
   describe("找不到「已发送」文件夹", () => {
