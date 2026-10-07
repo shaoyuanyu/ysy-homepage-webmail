@@ -22,6 +22,6 @@ docker build -t webmail .        # 本地构建镜像
 
 ## 部署链路（勿改）
 
-代码推送 main → 主仓库部署流水线给本仓库推 `release-v<日期>-<短SHA>` 标签 → **阿里云 ACR**（镜像仓库 `ysy-homepage-webmail`，内置构建规则构建根 Dockerfile）产出同名版本号镜像 → VPS 按版本号拉取部署。回退 = 主仓库流水线 workflow_dispatch 指定旧版本号。
+代码推送 main → 主仓库部署流水线给本仓库推 `release-v<提交日期>-<短SHA>` 标签（版本号取**本仓库该提交自身的日期**，不是部署日期——没改动时版本号不变，主仓库流水线会直接复用已有镜像、不重建也不重启容器）→ **阿里云 ACR**（镜像仓库 `ysy-homepage-webmail`，内置构建规则构建根 Dockerfile）产出同名版本号镜像 → VPS 上 `~/personal-homepage/deploy.sh` 按版本号拉取、校验入口 Cmd（必含 `tsx`）、重建并做健康探测。回退 = 主仓库流水线 workflow_dispatch 指定旧版本号，或 VPS 上 `bash deploy.sh <web版本> <邮件旧版本>`（不依赖 GitHub 健康）。
 
 ⚠ 镜像仓库的构建规则不需要自定义规则：**根 Dockerfile 就是 webmail 的**，ACR 内置规则天然正确（这正是本仓库独立出来的原因）。
