@@ -1,0 +1,18 @@
+# 依赖与构建产物（镜像里由 Dockerfile 各自安装）
+node_modules
+**/node_modules
+
+# 私有数据（绝不进构建上下文）：
+#   mail/data      = agent 库与凭据
+#   webmail/data   = 真实邮件数据库与 600 凭据
+#   .test-data     = 测试容器产物；.env* = 潜在密钥
+mail/data
+webmail/data
+*/.test-data
+*/.env
+*/.env.*
+
+# git / CI / 杂项
+.git
+.github
+**/*.log

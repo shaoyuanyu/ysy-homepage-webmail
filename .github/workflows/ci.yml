@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # 纯文档改动不触发
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            mail/pnpm-lock.yaml
+            webmail/pnpm-lock.yaml
+
+      # ⚠ 两个子项目必须**都装**：mail 的 tsconfig 编译范围含 ../webmail/test/
+      #   （共享的 SMTP sink 与工具），且 webmail 运行时 import ../mail/src/*。
+      - name: Install dependencies
+        run: |
+          (cd mail && pnpm install --frozen-lockfile)
+          (cd webmail && pnpm install --frozen-lockfile)
+
+      - name: Typecheck
+        run: |
+          (cd mail && pnpm typecheck)
+          (cd webmail && pnpm typecheck)
+
+      # mail 的部分用例会起 dovecot 容器（CONTAINER_BIN 缺省 docker，
+      # ubuntu runner 原生可用）。
+      - name: Test
+        run: |
+          (cd mail && pnpm test)
+          (cd webmail && pnpm test)

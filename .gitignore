@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 运行时私有数据（凭据 / 邮件库 / 测试产物）
+data/
+.test-data/
+
+# 本地缓存
+.cache-*
+
+# 环境变量
+.env
+.env.*
+
+*.log
