@@ -1,3 +1,5 @@
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -149,6 +151,76 @@ describe("webmaild HTTP API", () => {
     expect(res.headers.get("content-type")).toContain("text/plain");
     const buf = Buffer.from(await res.arrayBuffer());
     expect(buf.toString("utf8")).toBe("hello report\n");
+  });
+
+  it("按需取原文：把 truncated 行恢复成完整邮件（打开不再空白），且可下载 .eml 原件", async () => {
+    // 2026-10-07：>50MB 的邮件抓取时只入库元数据（红线 12），站内点开是空的。这条用例
+    // 模拟那种行（把已同步邮件的 eml_path 清空 + truncated=1），再走 POST /source 补取。
+    const detailPath = `/message/${encodeURIComponent("mid:w04@test.local")}`;
+    const before = (await (await api(detailPath)).json()) as { text: string; attachments: unknown[] };
+    // ⚠ 04.eml 的**正文**是「See attached report.」，"hello report" 是那个附件 report.txt 的
+    //   内容（base64）——两者别混（2026-10-07 首跑时断言写错，真跑才发现）
+    expect(before.text).toContain("See attached report");
+    expect(before.attachments.length).toBe(1);
+
+    // 模拟「只入库了索引」：删原文文件、清 eml_path、truncated=1
+    const row = tc.ctx.db
+      .prepare("SELECT eml_path FROM messages WHERE message_id = ?")
+      .get("mid:w04@test.local") as { eml_path: string };
+    rmSync(join(tc.dir, row.eml_path));
+    tc.ctx.db
+      .prepare("UPDATE messages SET truncated = 1, eml_path = '' WHERE message_id = ?")
+      .run("mid:w04@test.local");
+
+    const empty = (await (await api(detailPath)).json()) as { text: string; attachments: unknown[] };
+    expect(empty.text).toBe("");
+    expect(empty.attachments.length).toBe(0);
+
+    // GET 原件：没有原文 → 404（不是 200 空文件）
+    const missing = await api(`${detailPath}/source`);
+    expect(missing.status).toBe(404);
+
+    // POST 按需取：从 Dovecot 取回原文、落盘、回填索引
+    const fetched = await api(`${detailPath}/source`, { method: "POST" });
+    expect(fetched.status).toBe(200);
+    expect((await fetched.json()) as { fetched: boolean; size: number }).toMatchObject({ fetched: true });
+
+    const after = (await (await api(detailPath)).json()) as {
+      text: string;
+      attachments: unknown[];
+      truncated: boolean;
+    };
+    expect(after.text).toContain("See attached report");
+    expect(after.attachments.length).toBe(1);
+    expect(after.truncated).toBe(false);
+
+    // 幂等：再点一次不再下载
+    const again = await api(`${detailPath}/source`, { method: "POST" });
+    expect((await again.json()) as { fetched: boolean }).toMatchObject({ fetched: false });
+
+    // GET 原件：下载到 .eml（octet-stream + attachment）
+    const eml = await api(`${detailPath}/source`);
+    expect(eml.status).toBe(200);
+    expect(eml.headers.get("content-type")).toContain("application/octet-stream");
+    expect(eml.headers.get("content-disposition")).toContain(".eml");
+    // 原件是 MIME 原文：正文行与附件的 base64 都在里面
+    const raw = Buffer.from(await eml.arrayBuffer()).toString("utf8");
+    expect(raw).toContain("Subject: Report with attachment");
+    expect(raw).toContain("See attached report");
+  });
+
+  it("详情返回原始邮件头（按原顺序、原始行）", async () => {
+    const detail = (await (
+      await api(`/message/${encodeURIComponent("mid:w01@test.local")}`)
+    ).json()) as { headers: { key: string; line: string }[] };
+    const keys = detail.headers.map((h) => h.key.toLowerCase());
+    expect(keys).toContain("from");
+    expect(keys).toContain("subject");
+    expect(keys).toContain("message-id");
+    // 顺序 = 原文顺序（From 在 Subject 之前）
+    expect(keys.indexOf("from")).toBeLessThan(keys.indexOf("subject"));
+    // line 是原始行（含 key 与冒号）
+    expect(detail.headers[keys.indexOf("subject")].line.toLowerCase()).toContain("subject:");
   });
 
   it("健康检查报告每账号最近同步状态", async () => {

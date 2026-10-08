@@ -14,6 +14,14 @@ export async function connectAccount(
     // 显式超时：服务端无响应时 fast-fail，而非无限挂起
     socketTimeout: 30_000,
   });
+  // ⚠ 必须自己挂一个 error 监听（2026-10-07 补）：连接失败 / 超时后 imapflow 仍可能
+  // 异步发 'error'，EventEmitter 上没有监听器的 'error' 会抛成未捕获异常、把整个
+  // webmaild / mailagentd 进程打挂（accounts.ts 的 testAccountConnection 早就这么做，
+  // 这里是漏的）。真正的失败仍由 connect() 的 reject 与后续命令的 reject 暴露。
+  // ⚠ 反向验证记录：把本行注释掉后 robustness 用例（ECONNREFUSED 立即失败）仍全绿——
+  //   「连接被拒」这条路 imapflow 不补发 error；本行防的是**已建连之后**的异步错误
+  //   （socketTimeout / 服务端掐断），与 accounts.test.ts 那条回归同源。
+  client.on("error", () => {});
   await client.connect();
   return client;
 }

@@ -8,13 +8,19 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 |---|---|
 | `src/types.ts` | `WebmailAccount`（共享注册表结构 + SMTP 字段）、`SendInput` 等 |
 | `src/config.ts` | 账号注册表与凭据加载（`accounts.json` / `credentials.json`） |
-| `src/write.ts` | IMAP 写操作：`setFlags`（`+FLAGS`/`-FLAGS`）、`detectSentFolder` / `detectTrashFolder`（`\Sent` / `\Trash` 探测）、`appendRaw`、`moveUid`、`deleteUid` |
+| `src/write.ts` | IMAP 写操作：`setFlags` / `setFlagsBatch`（`+FLAGS`/`-FLAGS`，批量时一个文件夹一次 `STORE`）、`applyFlagChange`（本地索引重算的纯函数）、`detectSentFolder` / `detectTrashFolder` / `detectDraftsFolder` / `detectJunkFolder`、`appendRaw`、`moveUid`、`deleteUid` |
 | `src/send.ts` | 发信：MailComposer 构造一次 → SMTP 与 `APPEND` 用同一份字节（红线 6）；先探测「已发送」再发信 |
 | `src/render.ts` | HTML 邮件渲染管线：sanitize-html + 远程内容白名单 + cid 重写 + style 里的 url() 剥除（4.4） |
 | `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`，`WEBMAIL_HOST` / `WEBMAIL_PORT` 可调）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接） |
 | `src/accounts.ts` | 账号增删（4.11）：`normalizeAccountInput` 纯校验/归一 + `testAccountConnection`（IMAP 登录 + SMTP verify）+ `addAccount` / `deleteAccount`（原子落盘、失败回滚） |
 | `src/contacts.ts` | 通讯录 CRUD + 自动收录（4.10）|
-| `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + API 常驻 |
+| `src/folders.ts` | 文件夹清单（4.15）：IMAP `LIST` → `{path,name,specialUse,selectable}`；`suggestSyncFolders`（INBOX + 已发送/草稿/已删除/垃圾）供新增账号预填 |
+| `src/attachment.ts` | 附件响应头决策（4.15 安全）：类型白名单（图片不含 SVG + text/plain）才可原样 inline，其余降级 octet-stream + attachment；附 nosniff / CSP |
+| `src/source.ts` | 原文按需补取（4.15）：truncated 的超大邮件显式取回并回填索引；`readSource` 供 .eml 下载 |
+| `src/backup.ts` | 邮件数据快照（4.15）：SQLite 在线备份 + `eml/` 硬链 + 凭据 600 + 保留 N 份；`tsx src/backup.ts` 可直接跑 |
+| `src/drafts.ts` / `src/draft-mirror.ts` | 服务端草稿（4.9）+ 镜像到账号服务商「草稿」文件夹（单向） |
+| `src/locks.ts` | 账号级 IMAP 互斥锁（红线 10）；同步 / 标记 / 移动 / 发信 / 草稿镜像共用 |
+| `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + 草稿镜像扫描（4s）+ API 常驻 |
 
 ## 数据目录
 
@@ -36,17 +42,30 @@ pnpm test                         # 测试（CONTAINER_BIN=podman pnpm test）
 pnpm typecheck
 ```
 
-## 测试（46 条，test/）
+## 测试（test/）
 
-集成用例对真实 Dovecot 容器断言，SMTP 侧用 `smtp-server` 起内存接收端：
+**不依赖容器**的部分（`pnpm exec vitest run test/attachment.test.ts test/folders.test.ts test/robustness.test.ts test/source.test.ts test/backup.test.ts`）：
+附件类型白名单/文件名净化、文件夹清单排序与特殊用途识别、推荐同步集、`folder` 参数解析与列表筛选（HTTP + 内存库）、
+`parseLimit` 负数钳制、单账号同步失败隔离、账号锁串行与释放、草稿镜像并发去重、原文读取与补取的错误分支、备份快照语义（硬链/600/保留份数）。
+
+其余为集成用例：对真实 Dovecot 容器断言，SMTP 侧用 `smtp-server` 起内存接收端：
 
 - **发信**：SMTP 接收端收到的字节与 IMAP「已发送」里留底的字节**逐字节一致**（Message-ID 相同）；找不到「已发送」文件夹时拒发且 SMTP 不发出；非法地址被拒。
 - **写操作**：标已读对两个账号的副本**一起写**（服务端 flags 读回验证 + 本地索引同步）；星标往返不触碰 `\Seen`；移动单副本到回收站不影响另一个副本；最后一个副本删除后消息从索引清理。
 - **API**：合并视图倒序 + 跨账号副本聚合、账号筛选、**状态 / 方向筛选（unseen / flagged / received / sent，方向口径与前端「已发送」徽章一致，见 src/write.ts 的 `SENT_FOLDER_NAMES`）**、trigram / LIKE 搜索、游标分页、远程图片白名单（剥除 / 保留 / cid 重写 / style url() 剥除）、附件端点、健康检查。
 - **通讯录**：CRUD + 邮箱唯一（`COLLATE NOCASE`）、自动收录（按通信次数聚合、排除自身账号与已保存地址）、`suggest` 顺序（已保存在前）、列表发件人名字被通讯录覆盖。
 - **账号管理**：校验分支（缺字段 / 邮箱非法 / 端口越界 / id 冲突 409 / folders 全空）、连接失败（密码错 / 不可达端口）**不落盘且进程不挂**、HTTP 400/502/201/DELETE、落盘后 `credentials.json` 为 600 且顶层字段不被覆盖、删除清理副本与孤儿消息、至少保留一个账号 409。
+- **文件夹（2026-10-07）**：`GET /folders`（清单 + `suggested` + 当前白名单、未知账号 404）、`POST /folders` 预览（不落盘、密码错 502）、新增账号不传 `folders` 时按服务端清单自动预填。
+- **批量标记（多选，2026-10-07）**：`POST /flags {messageIds:[…]}` —— 一批消息的**全部副本**一起写（红线 8）、每账号一条连接、每文件夹一次 STORE；单账号失败进 `skipped` 不阻断；>500 条 400；混入不存在的 id 不报错（`updated/messages` 为 0）。
+- **原文与取证（2026-10-07）**：把已同步邮件改造成 truncated（删原文 + 清 `eml_path`）后，`GET /source` 404 → `POST /source` 取回并回填（正文/附件/truncated 复位）→ 再 POST 幂等 → `GET /source` 拿到 .eml 字节；详情返回按原文顺序的 `headers`。
 
-## 容器镜像（`webmail.Dockerfile`，镜像名 `webmail`）
+## 备份
+
+`pnpm backup`（容器内 `./node_modules/.bin/tsx src/backup.ts`，VPS 侧入口是主仓库的
+`scripts/backup-webmail.sh`）→ `$WEBMAIL_DATA_DIR/backups/<时间戳>/`。
+⚠ 同一块盘上：防误删/误改，不防磁盘损坏（异地仍待 OSS，MAIL-AGENT.md 第十节）。
+
+## 容器镜像（根 `Dockerfile`，镜像名 `webmail`）
 
 - **构建上下文 = 仓库根**：webmail 运行时 import `mail/` 的共享模块，且 Node 按「引用方所在目录」解析依赖——镜像里同时装两棵树：`webmail/node_modules`（全量，tsx 在 devDependencies、是运行时启动器）与 `mail/node_modules`（`--prod`）。
 - 构建：`docker build -f webmail.Dockerfile -t webmail .`（better-sqlite3 在 alpine 上源码编译，python3/make/g++ 仅存在于 builder 阶段）。

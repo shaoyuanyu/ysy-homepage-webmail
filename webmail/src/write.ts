@@ -19,19 +19,53 @@ export async function setFlags(
   uid: number,
   change: FlagChange
 ): Promise<void> {
-  await openReadWrite(client, folder);
+  await setFlagsBatch(client, folder, [uid], change);
+}
+
+/**
+ * 批量写标记（2026-10-07，多选批量操作）：一个文件夹一次 `STORE`。
+ *
+ * 与 `setFlags` 同一红线（只 +FLAGS / -FLAGS，绝不裸 FLAGS 整体替换；一律 `{ uid: true }`）：
+ * 把一批 UID 用逗号拼成序列集，加标记一次、去标记一次——不按 UID 逐个往返（那是 N 次
+ * 命令，服务商侧也更容易被限流）。调用方保证 uids 来自本地索引（copies 表）且已按
+ * 文件夹分组。
+ */
+export async function setFlagsBatch(
+  client: ImapFlow,
+  folder: string,
+  uids: number[],
+  change: FlagChange
+): Promise<void> {
+  if (uids.length === 0) return;
   const add: string[] = [];
   const del: string[] = [];
   if (change.seen === true) add.push("\\Seen");
   if (change.seen === false) del.push("\\Seen");
   if (change.flagged === true) add.push("\\Flagged");
   if (change.flagged === false) del.push("\\Flagged");
+  if (add.length === 0 && del.length === 0) return;
+  await openReadWrite(client, folder);
+  const set = uids.join(",");
   if (add.length > 0) {
-    await client.messageFlagsAdd(String(uid), add, { uid: true });
+    await client.messageFlagsAdd(set, add, { uid: true });
   }
   if (del.length > 0) {
-    await client.messageFlagsRemove(String(uid), del, { uid: true });
+    await client.messageFlagsRemove(set, del, { uid: true });
   }
+}
+
+/**
+ * 本地索引里的 flags 字符串按变更结果重算（纯函数，便于单测）。
+ * 口径必须与服务端一致：只增删 `\\Seen` / `\\Flagged`，其余标记原样保留
+ * （红线 2 的本地对应物——别把整串覆盖掉，`\\Answered` / `\\Draft` 会被抹掉）。
+ */
+export function applyFlagChange(flags: string, change: FlagChange): string {
+  const set = new Set(flags.split(" ").filter(Boolean));
+  if (change.seen === true) set.add("\\Seen");
+  if (change.seen === false) set.delete("\\Seen");
+  if (change.flagged === true) set.add("\\Flagged");
+  if (change.flagged === false) set.delete("\\Flagged");
+  return [...set].join(" ");
 }
 
 /**
@@ -77,9 +111,23 @@ export async function detectSentFolder(client: ImapFlow): Promise<string | null>
   return detectSpecialFolder(client, "\\Sent", SENT_FOLDER_NAMES);
 }
 
+/** 「回收站」文件夹的回退候选名（服务器没给 `\Trash` special-use 时的兜底） */
+export const TRASH_FOLDER_NAMES = ["Trash", "Deleted Items", "Deleted Messages", "已删除邮件", "已删除"];
+
 /** 「回收站」文件夹探测：同上，删除时优先移入 */
 export async function detectTrashFolder(client: ImapFlow): Promise<string | null> {
-  return detectSpecialFolder(client, "\\Trash", ["Trash", "Deleted Items", "已删除邮件", "已删除"]);
+  return detectSpecialFolder(client, "\\Trash", TRASH_FOLDER_NAMES);
+}
+
+/**
+ * 「垃圾邮件」文件夹的回退候选名（服务器没给 `\Junk` special-use 时的兜底）。
+ * 阿里企业邮的文件夹名是「垃圾邮件」，已在名单内（2026-10-07 加，供「标为垃圾」用）。
+ */
+export const JUNK_FOLDER_NAMES = ["Junk", "Junk E-mail", "Spam", "Bulk Mail", "垃圾邮件", "垃圾箱"];
+
+/** 「垃圾邮件」文件夹探测：优先 \Junk 特殊用途标志位，回退常见名；找不到返回 null */
+export async function detectJunkFolder(client: ImapFlow): Promise<string | null> {
+  return detectSpecialFolder(client, "\\Junk", JUNK_FOLDER_NAMES);
 }
 
 /**
@@ -87,6 +135,12 @@ export async function detectTrashFolder(client: ImapFlow): Promise<string | null
  * 阿里企业邮实测给 `\Drafts`（草稿），此列表只作保险。
  */
 export const DRAFTS_FOLDER_NAMES = ["Drafts", "Draft", "草稿", "草稿箱", "已草稿"];
+
+/**
+ * 「归档」文件夹的回退候选名（服务器没给 `\Archive` special-use 时的兜底）。
+ * 站内没有"归档"动作，此表只服务 `POST /move` 的 `\Archive` 记号（自动化/脚本可用）。
+ */
+export const ARCHIVE_FOLDER_NAMES = ["Archive", "Archives", "归档"];
 
 /** 「草稿」文件夹探测：优先 \Drafts 特殊用途标志位（RFC 6154），回退常见名；找不到返回 null */
 export async function detectDraftsFolder(client: ImapFlow): Promise<string | null> {
@@ -148,4 +202,41 @@ export async function deleteUid(client: ImapFlow, folder: string, uid: number): 
   await openReadWrite(client, folder);
   const ok = await client.messageDelete(String(uid), { uid: true });
   if (!ok) throw new Error(`删除失败：${folder}#${uid}`);
+}
+
+/**
+ * 移动目标可以是**特殊用途记号**（`\Junk` 这类，RFC 6154 的 special-use 名）而不是路径：
+ * 同一个概念各家服务商叫法不同（阿里云「垃圾邮件」、Gmail `[Gmail]/Spam`），让服务端在
+ * **目标账号上**探测比让前端先 LIST 一遍文件夹更稳——前端不必知道它叫什么，也不会因为
+ * 清单过期而把信搬错地方。
+ *
+ * 2026-10-07 加：前端删掉「文件夹」视图与「移动」菜单后，只剩「标为垃圾邮件」一个整理
+ * 动作（详情页工具栏），它需要的正是"这个账号的垃圾邮件夹在哪"——与其为它保留一份前端
+ * 文件夹清单，不如把这件事交给本来就持有 IMAP 连接的服务端。
+ */
+const SPECIAL_MOVE_TARGETS: Record<string, { names: string[]; label: string }> = {
+  "\\Junk": { names: JUNK_FOLDER_NAMES, label: "垃圾邮件" },
+  "\\Trash": { names: TRASH_FOLDER_NAMES, label: "已删除邮件" },
+  "\\Sent": { names: SENT_FOLDER_NAMES, label: "已发送" },
+  "\\Drafts": { names: DRAFTS_FOLDER_NAMES, label: "草稿" },
+  "\\Archive": { names: ARCHIVE_FOLDER_NAMES, label: "归档" },
+};
+
+/** 特殊用途记号的展示名（错误文案用）；普通路径返回 null */
+export function specialMoveTargetLabel(dest: string): string | null {
+  return SPECIAL_MOVE_TARGETS[dest]?.label ?? null;
+}
+
+/**
+ * 把移动目标解析成该账号上的**真实文件夹路径**：
+ * - 普通路径原样返回，**不产生任何 IMAP 请求**；
+ * - 特殊用途记号（`\Junk` 等）在本账号上探测（标志位 → 常见名回退），找不到返回 null
+ *   ——调用方决定是跳过该账号还是报错（见 api.ts 的 applyCopiesOp）；
+ * - 不认识的记号直接抛错：那是编程错误，静默当路径用会把信搬到一个诡异的名字下。
+ */
+export async function resolveMoveTarget(client: ImapFlow, dest: string): Promise<string | null> {
+  if (!dest.startsWith("\\")) return dest;
+  const spec = SPECIAL_MOVE_TARGETS[dest];
+  if (!spec) throw new Error(`不支持的特殊用途目标：${dest}`);
+  return detectSpecialFolder(client, dest, spec.names);
 }

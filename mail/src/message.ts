@@ -52,7 +52,8 @@ function stripHtml(html: string): string {
   return sanitizeHtml(html, { allowedTags: [], allowedAttributes: {} });
 }
 
-function snippetOf(body: string): string {
+/** 摘要口径（列表行第二行）：压平空白、截 200 字。webmail 侧按需取原文时复用（source.ts） */
+export function snippetOf(body: string): string {
   return body.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 

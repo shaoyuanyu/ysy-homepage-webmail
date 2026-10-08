@@ -128,6 +128,14 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
 
   const raw = await buildDraftRaw(account, row);
   await withAccountLock(account.id, async () => {
+    // 加锁后复核 dirty（2026-10-07）：`row` 是加锁**之前**读到的快照，等锁期间草稿
+    // 可能已被发出 / 删除 / 被上一轮镜像完成——那时 server_dirty 已归 0，再投一次就会
+    // 在服务商侧留下重复副本。
+    const current = ctx.db
+      .prepare("SELECT server_dirty FROM drafts WHERE id = ?")
+      .get(row.id) as { server_dirty: number } | undefined;
+    if (!current || current.server_dirty === 0) return;
+
     const client = await connectAccount(account, cred);
     try {
       const folder = await detectDraftsFolder(client);
@@ -160,8 +168,30 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
   });
 }
 
-/** 扫描一轮：投递所有「dirty 且已安静 quietMs」的草稿（定时器与测试共用入口） */
-export async function mirrorDrafts(
+/**
+ * 扫描一轮：投递所有「dirty 且已安静 quietMs」的草稿（定时器与测试共用入口）。
+ *
+ * ⚠ 同一时刻只允许一轮（2026-10-07）：4 秒定时器在一轮耗时 >4s 时会叠上第二轮，
+ * 而两轮都会挑到同一批仍是 dirty 的行 → 同一草稿被 APPEND 两次（服务商侧重复副本）。
+ */
+export function mirrorDrafts(
+  ctx: WebmailContext,
+  opts: { quietMs?: number } = {}
+): Promise<{ mirrored: number; failed: number }> {
+  if (sweepInFlight) return sweepInFlight;
+  const tracked: Promise<{ mirrored: number; failed: number }> = doMirrorDrafts(ctx, opts).finally(
+    () => {
+      if (sweepInFlight === tracked) sweepInFlight = null;
+    }
+  );
+  sweepInFlight = tracked;
+  return tracked;
+}
+
+/** 进行中的一轮扫描（见 mirrorDrafts 的并发说明） */
+let sweepInFlight: Promise<{ mirrored: number; failed: number }> | null = null;
+
+async function doMirrorDrafts(
   ctx: WebmailContext,
   opts: { quietMs?: number } = {}
 ): Promise<{ mirrored: number; failed: number }> {

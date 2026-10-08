@@ -15,8 +15,22 @@ export function openDb(dbPath: string): Db {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
+  // mail.db 会被两个进程打开（webmaild 写、将来的 mailagentd 读/写自己的表），
+  // 没有 busy_timeout 时写锁冲突会立刻抛 SQLITE_BUSY（2026-10-07 加）
+  db.pragma("busy_timeout = 5000");
   migrate(db);
   return db;
+}
+
+/**
+ * 按列存在性补列（幂等）。逐列独立判断——整批 ALTER 中途失败时，
+ * 下一轮仍能补齐剩下的列（曾一次性 ADD 5 列，中途失败会永久缺列）。
+ */
+function addColumnIfMissing(db: Db, table: string, column: string, ddl: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (cols.some((c) => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  return true;
 }
 
 function migrate(db: Db): void {
@@ -111,14 +125,23 @@ function migrate(db: Db): void {
     );
   `);
 
-  // 草稿服务器镜像列（见上）：ALTER 不走 CREATE IF NOT EXISTS，按列存在性判断
-  const draftCols = db.prepare("PRAGMA table_info(drafts)").all() as { name: string }[];
-  if (!draftCols.some((c) => c.name === "server_dirty")) {
-    db.exec("ALTER TABLE drafts ADD COLUMN server_dirty INTEGER NOT NULL DEFAULT 0");
-    db.exec("ALTER TABLE drafts ADD COLUMN server_account TEXT NOT NULL DEFAULT ''");
-    db.exec("ALTER TABLE drafts ADD COLUMN server_folder TEXT NOT NULL DEFAULT ''");
-    db.exec("ALTER TABLE drafts ADD COLUMN server_uid INTEGER");
-    db.exec("ALTER TABLE drafts ADD COLUMN server_uidvalidity TEXT NOT NULL DEFAULT ''");
+  // 草稿服务器镜像列（见上）：ALTER 不走 CREATE IF NOT EXISTS，按列存在性逐列判断
+  const addedServerDirty = addColumnIfMissing(
+    db,
+    "drafts",
+    "server_dirty",
+    "server_dirty INTEGER NOT NULL DEFAULT 0"
+  );
+  addColumnIfMissing(db, "drafts", "server_account", "server_account TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "drafts", "server_folder", "server_folder TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "drafts", "server_uid", "server_uid INTEGER");
+  addColumnIfMissing(
+    db,
+    "drafts",
+    "server_uidvalidity",
+    "server_uidvalidity TEXT NOT NULL DEFAULT ''"
+  );
+  if (addedServerDirty) {
     // 存量草稿一次性标记待投递：它们建于镜像功能上线前，阿里云网页端还看不到
     // （只在本分支执行——全新库的 CREATE TABLE 已带该列，不会走到这里）
     db.exec("UPDATE drafts SET server_dirty = 1");
@@ -126,19 +149,11 @@ function migrate(db: Db): void {
 
   // 4.7 会话组装新增列：refs_json（规范化引用链，NULL = 存量行待回填）、
   // has_attach（是否有可下载附件）。ALTER 不走 CREATE IF NOT EXISTS，按列存在性判断。
-  const cols = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
-  if (!cols.some((c) => c.name === "refs_json")) {
-    db.exec("ALTER TABLE messages ADD COLUMN refs_json TEXT");
-  }
-  if (!cols.some((c) => c.name === "has_attach")) {
-    db.exec("ALTER TABLE messages ADD COLUMN has_attach INTEGER NOT NULL DEFAULT 0");
-  }
+  addColumnIfMissing(db, "messages", "refs_json", "refs_json TEXT");
+  addColumnIfMissing(db, "messages", "has_attach", "has_attach INTEGER NOT NULL DEFAULT 0");
 
   // 联系人归属账号（4.14）：'' = 本地联系人（不归属任何账号）。存量行默认为本地。
-  const contactCols = db.prepare("PRAGMA table_info(contacts)").all() as { name: string }[];
-  if (!contactCols.some((c) => c.name === "account")) {
-    db.exec("ALTER TABLE contacts ADD COLUMN account TEXT NOT NULL DEFAULT ''");
-  }
+  addColumnIfMissing(db, "contacts", "account", "account TEXT NOT NULL DEFAULT ''");
 }
 
 /**

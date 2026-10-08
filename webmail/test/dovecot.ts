@@ -12,7 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const workRoot = join(here, "..", ".test-data");
 export const fixturesDir = join(here, "fixtures", "eml");
 
-/** Sent / Drafts / Trash 带 special_use 标志位（RFC 6154），供探测逻辑走主路径 */
+/** Sent / Drafts / Trash / Junk 带 special_use 标志位（RFC 6154），供探测逻辑走主路径 */
 const DOVECOT_CONF = `protocols = imap
 listen = *
 ssl = no
@@ -32,6 +32,10 @@ namespace inbox {
   }
   mailbox Trash {
     special_use = \\Trash
+    auto = create
+  }
+  mailbox Junk {
+    special_use = \\Junk
     auto = create
   }
 }

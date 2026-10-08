@@ -4,6 +4,7 @@ import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import type { AccountCredential, CredentialsFile } from "../../mail/src/types.js";
 import type { WebmailContext } from "./api.js";
+import { listAccountFolders, listFoldersWith, suggestSyncFolders, type FolderInfo } from "./folders.js";
 import type { WebmailAccount, WebmailAccountsFile } from "./types.js";
 
 /** 业务错误：status 400 参数非法 / 409 冲突 / 502 连接测试失败，由 API 层映射为 HTTP 状态码 */
@@ -120,13 +121,16 @@ export function normalizeAccountInput(
 }
 
 /**
- * 连接测试：IMAP 登录（connect + logout）与 SMTP verify 都通过才算可用。
+ * 连接测试：IMAP 登录（connect + LIST + logout）与 SMTP verify 都通过才算可用。
  * 失败抛 AccountError（502）并带原始错误信息，不落盘、不进 ctx。
+ *
+ * 返回顺带列出的**文件夹清单**（2026-10-07）：新增账号时用它预填「同步文件夹」，
+ * 用户不必知道服务器上的文件夹叫什么（LIST 失败不影响连接测试结论，退化为空数组）。
  */
 export async function testAccountConnection(
   account: WebmailAccount,
   cred: AccountCredential
-): Promise<void> {
+): Promise<FolderInfo[]> {
   // ⚠ 不能复用 connectAccount：必须自己持有 ImapFlow 实例并挂 error 监听——
   // 连接失败后 imapflow 仍可能异步发出 'error'（如 socketTimeout），
   // EventEmitter 无监听器的 'error' 会 throw 成未捕获异常、把整个进程打挂。
@@ -148,6 +152,13 @@ export async function testAccountConnection(
       502
     );
   }
+  let folders: FolderInfo[] = [];
+  try {
+    folders = await listFoldersWith(imap);
+  } catch {
+    // 列文件夹失败不算连接失败：账号仍可用，只是拿不到预填清单
+    folders = [];
+  }
   await imap.logout().catch(() => {});
   imap.close();
   try {
@@ -165,6 +176,72 @@ export async function testAccountConnection(
       502
     );
   }
+  return folders;
+}
+
+/**
+ * 文件夹预览（2026-10-07）：用**表单里现填的连接参数**登录并列出文件夹，
+ * 供「添加账号」时的文件夹选择器使用（账号还没落盘，拿不到 id 就走这条）。
+ * 已保存账号在编辑时可以不重填密码 —— 那时用已存凭据。
+ */
+export async function previewFolders(
+  ctx: WebmailContext,
+  input: {
+    id?: string;
+    email?: string;
+    imapHost?: string;
+    imapPort?: number;
+    imapSecure?: boolean;
+    username?: string;
+    password?: string;
+  }
+): Promise<{ folders: FolderInfo[]; suggested: string[] }> {
+  const existing = input.id ? ctx.accounts.get(input.id) : undefined;
+  let account: WebmailAccount;
+  let cred: AccountCredential;
+  if (existing && !input.password) {
+    const stored = ctx.credentials.get(existing.id);
+    if (!stored) throw new AccountError(`账号 ${existing.id} 缺少凭据`, 404);
+    account = existing;
+    cred = stored;
+  } else {
+    const imapHost = input.imapHost?.trim();
+    const email = input.email?.trim();
+    const password = input.password ?? "";
+    if (!imapHost) throw new AccountError("缺少 IMAP 主机");
+    if (!isPort(input.imapPort)) throw new AccountError("IMAP 端口非法（1-65535）");
+    if (typeof input.imapSecure !== "boolean") throw new AccountError("imapSecure 必须是布尔值");
+    if (!password) throw new AccountError("缺少密码（或授权码）");
+    if (!email || !EMAIL_RE.test(email)) throw new AccountError("邮箱地址非法");
+    account = {
+      id: existing?.id ?? "__preview__",
+      displayName: existing?.displayName ?? email,
+      email,
+      provider: existing?.provider ?? "custom",
+      color: existing?.color ?? "#0ea5e9",
+      imapHost,
+      imapPort: input.imapPort,
+      imapSecure: input.imapSecure,
+      smtpHost: existing?.smtpHost ?? imapHost,
+      smtpPort: existing?.smtpPort ?? 465,
+      smtpSecure: existing?.smtpSecure ?? true,
+      folders: ["INBOX"],
+      enabled: true,
+    };
+    cred = { username: input.username?.trim() || email, password };
+  }
+  // 连接失败按 502 回（与新增/编辑账号的连接测试同一语义：连不上是"上游不可用"，
+  // 不是客户端错误）；不包装的话会落到 API 层的兜底 500，前端与测试都分不清
+  let folders: FolderInfo[];
+  try {
+    folders = await listAccountFolders(account, cred);
+  } catch (err) {
+    throw new AccountError(
+      `IMAP 连接失败：${err instanceof Error ? err.message : String(err)}`,
+      502
+    );
+  }
+  return { folders, suggested: suggestSyncFolders(folders) };
 }
 
 /** 原子写 JSON（tmp + rename）；凭证文件顺手收紧到 600 */
@@ -226,8 +303,20 @@ export async function addAccount(
   input: AddAccountInput,
   opts: { test?: boolean } = {}
 ): Promise<AccountSummary> {
-  const { account, cred } = normalizeAccountInput(input, new Set(ctx.accounts.keys()));
-  if (opts.test !== false) await testAccountConnection(account, cred);
+  // 未显式指定同步文件夹（缺省或空数组）= 让服务端清单决定：新增账号时自动选中
+  // INBOX + 已发送 / 草稿 / 已删除 / 垃圾邮件（2026-10-07）。不这么做的话新账号
+  // 只同步 INBOX，而「发件」页依赖服务器「已发送」在白名单里 → 永远是空的。
+  const autoFolders = !input.folders || input.folders.length === 0;
+  const { account, cred } = normalizeAccountInput(
+    autoFolders ? { ...input, folders: ["INBOX"] } : input,
+    new Set(ctx.accounts.keys())
+  );
+  let detected: FolderInfo[] = [];
+  if (opts.test !== false) detected = await testAccountConnection(account, cred);
+  if (autoFolders && detected.length > 0) {
+    const suggested = suggestSyncFolders(detected);
+    if (suggested.length > 0) account.folders = suggested;
+  }
   ctx.accounts.set(account.id, account);
   ctx.credentials.set(account.id, cred);
   try {
@@ -351,16 +440,20 @@ export function deleteAccount(ctx: WebmailContext, id: string): AccountSummary {
   const messageIds = ctx.db
     .prepare("SELECT DISTINCT message_id AS mid FROM copies WHERE account_id = ?")
     .all(id) as { mid: string }[];
-  ctx.db.prepare("DELETE FROM copies WHERE account_id = ?").run(id);
-  for (const { mid } of messageIds) {
-    const left = ctx.db
-      .prepare("SELECT COUNT(*) AS n FROM copies WHERE message_id = ?")
-      .get(mid) as { n: number };
-    if (left.n === 0) {
-      ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(mid);
-      ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(mid);
+  // 事务包裹（2026-10-07）：copies / messages / FTS 三处删除要么全成、要么全不成，
+  // 避免中途失败留下「副本没了、邮件正文与索引还在」的半截状态
+  ctx.db.transaction(() => {
+    ctx.db.prepare("DELETE FROM copies WHERE account_id = ?").run(id);
+    for (const { mid } of messageIds) {
+      const left = ctx.db
+        .prepare("SELECT COUNT(*) AS n FROM copies WHERE message_id = ?")
+        .get(mid) as { n: number };
+      if (left.n === 0) {
+        ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(mid);
+        ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(mid);
+      }
     }
-  }
+  })();
 
   ctx.accounts.delete(id);
   ctx.credentials.delete(id);

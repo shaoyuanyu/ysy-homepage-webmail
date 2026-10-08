@@ -88,7 +88,10 @@ function str(v: unknown, fallback = ""): string {
 /** 草稿列表（按最近更新倒序）；写信页据此找回「同一原信 / 新建」的最新草稿 */
 export function listDrafts(db: Db): Draft[] {
   const rows = db
-    .prepare("SELECT * FROM drafts ORDER BY updated_at DESC, id DESC")
+    // ⚠ 必须有 rowid 这个次序键：同一毫秒内建的两条草稿 updated_at 相同，只按 id（随机 uuid）
+    //   排序的话先后是随机的——写信页「找回最新草稿」与测试都会因此抖（2026-10-07 实测到）。
+    //   rowid 随插入递增、UPDATE 不动它，故「后建的在前」在这里是稳定的正确语义。
+    .prepare("SELECT * FROM drafts ORDER BY updated_at DESC, rowid DESC")
     .all() as DraftRow[];
   return rows.map(toDraft);
 }

@@ -180,6 +180,82 @@ describe("账号管理：增删（真实 dovecot + smtp sink）", () => {
     expect(tc.ctx.accounts.has("mirror")).toBe(false);
   });
 
+  it("HTTP：新增账号不传 folders → 自动按服务端清单预填（INBOX + 特殊用途文件夹）", async () => {
+    // 2026-10-07：以前缺省只同步 INBOX，而「发件」页依赖服务器「已发送」在白名单里
+    // → 新账号的「发件」页永远为空。现在 addAccount 用连接测试顺带拿到的 LIST 结果预填。
+    const res = await api("/accounts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...validInput({ email: "auto@local" }), folders: undefined }),
+    });
+    expect(res.status).toBe(201);
+    const summary = (await res.json()) as { id: string; folders: string[] };
+    // dovecot 测试容器：INBOX / Sent(\Sent) / Drafts(\Drafts) / Trash(\Trash) 带 special_use
+    expect(summary.folders[0]).toBe("INBOX");
+    expect(summary.folders).toContain("Sent");
+    expect(summary.folders).toContain("Drafts");
+    expect(summary.folders).toContain("Trash");
+    const onDisk = readAccounts(tc.dir).accounts.find((a) => a.email === "auto@local");
+    expect(onDisk?.folders).toEqual(summary.folders);
+    // 清理：后续用例（「删到只剩一个 409」）依赖账号数量，别把这个账号留下
+    const del = await api(`/accounts/${summary.id}`, { method: "DELETE" });
+    expect(del.status).toBe(200);
+  });
+
+  it("HTTP：GET /folders 返回清单 + 推荐集 + 当前白名单；POST /folders 预览（无需落盘）", async () => {
+    const res = await api("/folders?account=acc1");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      folders: { path: string; specialUse: string; selectable: boolean }[];
+      suggested: string[];
+      synced: string[];
+    };
+    expect(body.folders.map((f) => f.path)).toContain("INBOX");
+    expect(body.folders.find((f) => f.path === "Sent")?.specialUse).toBe("\\Sent");
+    expect(body.suggested[0]).toBe("INBOX");
+    expect(body.synced).toEqual(["INBOX", "Sent", "Trash"]);
+
+    // 未知账号 / 缺参数 → 404（文案区分两种情形）
+    expect((await api("/folders?account=nope")).status).toBe(404);
+    expect((await api("/folders")).status).toBe(404);
+
+    // 预览：用表单里的连接参数登录，不落盘
+    const before = readAccounts(tc.dir).accounts.length;
+    const preview = await api("/folders", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "mirror@local",
+        imapHost: dovecot.host,
+        imapPort: dovecot.port,
+        imapSecure: false,
+        username: "test",
+        password: "test",
+      }),
+    });
+    expect(preview.status).toBe(200);
+    const pv = (await preview.json()) as { folders: { path: string }[]; suggested: string[] };
+    expect(pv.folders.map((f) => f.path)).toContain("Sent");
+    expect(pv.suggested).toContain("Drafts");
+    expect(readAccounts(tc.dir).accounts.length).toBe(before);
+
+    // 预览：密码错 → 502，且不落盘
+    const bad = await api("/folders", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "mirror@local",
+        imapHost: dovecot.host,
+        imapPort: dovecot.port,
+        imapSecure: false,
+        username: "test",
+        password: "wrong",
+      }),
+    });
+    expect(bad.status).toBe(502);
+    expect(readAccounts(tc.dir).accounts.length).toBe(before);
+  });
+
   it("HTTP：修改账号（PUT）——备注名/发件人姓名/文件夹；元数据变更不测连接；404/400", async () => {
     // 只改元数据（备注名 / 发件人姓名 / 文件夹）：不触发连接测试，立即 200
     const res = await api("/accounts/acc2", {

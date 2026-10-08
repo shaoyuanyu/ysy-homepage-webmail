@@ -11,12 +11,16 @@ export async function withAccountLock<T>(accountId: string, fn: () => Promise<T>
   const prev = accountLocks.get(accountId) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
-  accountLocks.set(accountId, prev.then(() => gate));
+  // ⚠ 存的必须是**派生后的那条 promise**（`prev.then(() => gate)`）：finally 里要拿它
+  // 与 Map 的当前值比对。曾存派生值却拿 `gate` 去比，条件恒不成立 → 表项永不清除、
+  // promise 链随获取次数无限增长（占用可控但语义不对，2026-10-07 修）。
+  const chained = prev.then(() => gate);
+  accountLocks.set(accountId, chained);
   await prev;
   try {
     return await fn();
   } finally {
     release();
-    if (accountLocks.get(accountId) === gate) accountLocks.delete(accountId);
+    if (accountLocks.get(accountId) === chained) accountLocks.delete(accountId);
   }
 }
