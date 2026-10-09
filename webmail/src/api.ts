@@ -28,11 +28,12 @@ import type { AttachmentEntry } from "../../mail/src/mime.js";
 import { fetchTruncatedSource, readSource } from "./source.js";
 import { listAccountFolders, suggestSyncFolders } from "./folders.js";
 import { deleteServerDraftCopy, readDraftServerRef } from "./draft-mirror.js";
-import { createDraft, deleteDraft, listDrafts, updateDraft, type DraftInput } from "./drafts.js";
+import { readDraft, refreshDraftBox } from "./draft-store.js";
+import { createDraft, deleteDraft, findDrafts, listDrafts, updateDraft, type DraftInput } from "./drafts.js";
 import { withAccountLock } from "./locks.js";
 import { renderMailHtml } from "./render.js";
 import { sendMessage } from "./send.js";
-import { applyFlagChange, deleteUid, isSentFolderName, moveUid, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
+import { applyFlagChange, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
 
 /** 前端代理前缀：cid 内联附件重写到这个前缀下（webmaild 自身只绑回环） */
 const PUBLIC_PREFIX = process.env.WEBMAIL_PUBLIC_PREFIX ?? "/api/mail";
@@ -142,6 +143,74 @@ function listItem(ctx: WebmailContext, row: MessageRow, names?: Map<string, stri
 /** 标记匹配统一用「两侧补空格后整词匹配」，避免 `\Seen` 被子串误伤（与 listItem 的 split 口径一致） */
 const HAS_SEEN_SQL = "instr(' ' || c.flags || ' ', ' \\Seen ') > 0";
 const HAS_FLAGGED_SQL = "instr(' ' || c.flags || ' ', ' \\Flagged ') > 0";
+/**
+ * 「有任一副本被标记为草稿」= 这封不是邮件，是草稿（2026-10-10，阶段 0）。
+ *
+ * 起因：服务器草稿文件夹里的信被同步当成普通邮件索引进来，于是**「全部」列表里混着一堆
+ * 草稿**——实测用户 QQ 账号有 141 封存活草稿（最早 2014-08-31），它们在站内既不是"待写"
+ * 也不是"已收发"，纯属污染。草稿从此归**草稿箱**（`/drafts`，服务商草稿文件夹为唯一事实源，
+ * 见 draft-store.ts），邮件侧一律不看带 `\Draft` 标记的副本。
+ *
+ * ⚠ 判据用**标记**而不是文件夹名：文件夹名各服务商不同（草稿/`Drafts`/`[Gmail]/Drafts`），
+ *   而 `\Draft` 是 RFC 3501 的系统标记；我们 APPEND 草稿时也带它（draft-mirror.ts）。
+ *   这样即使有人把 `\Drafts` 勾进同步白名单，草稿也进不了邮件列表。
+ */
+const NOT_DRAFT_SQL =
+  "NOT EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND instr(' ' || c.flags || ' ', ' \\Draft ') > 0)";
+
+/**
+ * 「未读」= 存在无 `\Seen` 的 **INBOX** 副本（2026-10-10 第六轮起；旧口径是「任一副本无 `\Seen`」）。
+ *
+ * 全站只有一个「未读」：账号角标（`/accounts` 的 `unread` 只数 INBOX 副本）、底部状态栏、
+ * 「全部标为已读」、本筛选，四处同口径。起因见 NOT_JUNK_ONLY_SQL 上方那段（用户报障：
+ * 角标写 2、点开「未读」却列出 7 封——多出来的 5 封是垃圾箱里的未读信）。
+ *
+ * ⚠ **给了 `account` 时要连账号一起限定**（`unseenSql(accountIds)`）：角标是**逐账号**数的，
+ *   不做限定就会漏出这种消息——A 账号的 INBOX 副本未读，而这封同时另有 B 账号的副本，
+ *   于是「选 B + 未读」列出它、B 的角标却写 0（同一类不一致，只是换了个方向）。
+ *   实测用户数据里这种组合当前为 0 条，但判定必须写成账号内命中。
+ */
+function unseenSql(accountIds: string[]): string {
+  const scope = accountIds.length
+    ? ` AND c.account_id IN (${accountIds.map(() => "?").join(", ")})`
+    : "";
+  return `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id${scope} AND upper(trim(c.folder)) = 'INBOX' AND NOT (${HAS_SEEN_SQL}))`;
+}
+
+/** 不带账号范围时的写法（合并视图） */
+const UNSEEN_SQL = unseenSql([]);
+
+/**
+ * 「这封是正常邮件（至少有一份非垃圾副本）」——垃圾邮件不属于「邮件」（2026-10-10 第六轮）。
+ *
+ * 起因（用户报障）：大标题角标与「未读」开关都写「2」，点开「未读」却列出 7 封。查证后是
+ * **两套口径**：角标 = 收件箱未读（只数 INBOX 副本），而 `filter=unseen` 当时是「存在任一
+ * 副本无 `\Seen`」——2026-10-08 把「垃圾邮件」放进同步白名单后，垃圾箱里的未读信也被算了
+ * 进来（用户 QQ 账号 Junk 里正好 5 封未读 + 收件箱 2 封 = 7）。更糟的是这些垃圾邮件
+ * **混在「全部」里、行上没有任何标记**，跟正常邮件长得一模一样，多出来的 5 封是什么完全看不出。
+ *
+ * 定稿（用户 2026-10-10 选「全站同一个数」方案）：
+ * - **未读 = 收件箱未读**（见 UNSEEN_SQL）；
+ * - **垃圾邮件不算「邮件」**：不进「全部」、不进搜索结果，只能在「垃圾」tab 里显式按文件夹
+ *   查（那条路带 `folder` 参数，本排除**不生效**，否则垃圾 tab 会永远是空的）；
+ * - 判定用**文件夹名**：`copies` 表只有路径这一个线索（special-use 要连 IMAP LIST，
+ *   而列表查询不能依赖网络），故复用 write.ts 的 `JUNK_FOLDER_NAMES`——与「标为垃圾」的
+ *   移动目标探测、`folders.ts` 的名字回退是**同一份名单**。
+ *   ⚠ 名字不在名单里的自定义垃圾文件夹仍会漏进「全部」（「垃圾」tab 靠 special-use 标志位，
+ *   不受影响）；真要根治得把探测到的路径落库，见 MAIL-AGENT.md 4.9 的说明。
+ *
+ * ⚠ 消息**同时**有 INBOX 与垃圾副本时仍算正常邮件（`EXISTS` 命中 INBOX 那份）——实测数据里
+ * 这种组合不存在（0 条），但判定必须写成「存在非垃圾副本」而不是「不存在垃圾副本」。
+ */
+const JUNK_NAMES_LOWER = JUNK_FOLDER_NAMES.map((n) => n.trim().toLowerCase());
+
+/** 副本是否在垃圾文件夹（名字口径，见上） */
+function isJunkFolder(folder: string): boolean {
+  return JUNK_NAMES_LOWER.includes(folder.trim().toLowerCase());
+}
+
+/** 「至少一份非垃圾副本」；占位符与 `JUNK_NAMES_LOWER` 一一对应，绑参顺序必须与 where 拼接顺序一致 */
+const NOT_JUNK_ONLY_SQL = `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND lower(trim(c.folder)) NOT IN (${JUNK_NAMES_LOWER.map(() => "?").join(", ")}))`;
 
 /**
  * 分页大小：缺失 / 非数字 / 非正数一律回退 50，上限 200。
@@ -156,14 +225,20 @@ export function parseLimit(raw: string | null | undefined): number {
 
 /**
  * 状态 / 方向筛选（4.2、4.9），两个维度互相独立、可组合：
- * - `filter`（状态）：逗号分隔多值（2026-10-04 起）——`unseen` = 存在任一副本无 `\Seen`；
+ * - `filter`（状态）：逗号分隔多值（2026-10-04 起）——`unseen` = **存在无 `\Seen` 的 INBOX
+ *   副本**（收件箱未读，2026-10-10 第六轮改，见 `unseenSql`；旧口径「任一副本无 `\Seen`」
+ *   会把垃圾箱里的未读也算进来），且**给了 `account` 时限定在该账号内**（与账号角标同口径）；
  *   `flagged` = 存在任一副本有 `\Flagged`。多值取交集（`unseen,flagged` = 未读且加星，
  *   前端「星标」视图 + 「未读」开关需要这种组合）；单值写法不变。
  * - `direction`（方向）：`received` = 存在 INBOX 副本（收到的）；`sent` = 副本**全部**在
  *   「已发送」类文件夹（我发出的）
+ * - 不给 `folder` 时还排除「只躺在垃圾文件夹里」的邮件（见 `NOT_JUNK_ONLY_SQL`）；
+ *   给了 `folder` 就是「垃圾」tab 那条路，不排除。
  *
  * ⚠ `sent` 的口径必须与前端 `isSentItem`（`lib/mail/kind.ts`）完全一致，
  * 否则会出现「筛出来不对」的矛盾；两边共用同一份文件夹名名单（各持一份，改动同步）。
+ * ⚠ 本函数的 JS 路径（搜索）与 `listMessages` 的 SQL 路径必须**逐条同口径**：
+ *   草稿 → `NOT_DRAFT_SQL` / 垃圾 → `NOT_JUNK_ONLY_SQL` / 未读 → `unseenSql`。
  */
 function matchFilter(
   ctx: WebmailContext,
@@ -171,11 +246,29 @@ function matchFilter(
   filter: string | null,
   direction: string | null,
   folder?: FolderParam[] | null,
+  /** 账号范围（空 = 不限）：未读判定要跟着它收窄，见 `unseenSql` */
+  accountIds: string[] = [],
 ): boolean {
+  const copies = copiesOf(ctx, messageId);
+  // 草稿不是邮件（见 NOT_DRAFT_SQL）：任何视图都不出现，包括搜索结果
+  if (copies.some((c) => c.flags.split(" ").includes("\\Draft"))) return false;
+  // 垃圾不是邮件（见 NOT_JUNK_ONLY_SQL）：只在显式按文件夹查时（「垃圾」tab）才出现
+  if (!folder?.length && !copies.some((c) => !isJunkFolder(c.folder))) return false;
   const filters = new Set((filter ?? "").split(",").filter(Boolean));
   if (!filters.size && !direction && !folder) return true;
-  const copies = copiesOf(ctx, messageId);
-  if (filters.has("unseen") && !copies.some((c) => !c.flags.split(" ").includes("\\Seen"))) return false;
+  // 未读 = 收件箱未读（`unseenSql` 的 JS 版）：垃圾/发件/归档里的未读副本不算，
+  // 且给了账号范围时只认该账号的 INBOX 副本（与账号角标逐账号同口径）
+  if (
+    filters.has("unseen") &&
+    !copies.some(
+      (c) =>
+        (!accountIds.length || accountIds.includes(c.account_id)) &&
+        c.folder.trim().toUpperCase() === "INBOX" &&
+        !c.flags.split(" ").includes("\\Seen"),
+    )
+  ) {
+    return false;
+  }
   if (filters.has("flagged") && !copies.some((c) => c.flags.split(" ").includes("\\Flagged"))) return false;
   if (direction === "received" && !copies.some((c) => c.folder.trim().toUpperCase() === "INBOX")) return false;
   if (direction === "sent" && !(copies.length > 0 && copies.every((c) => isSentFolderName(c.folder)))) return false;
@@ -251,13 +344,19 @@ function listMessages(ctx: WebmailContext, url: URL) {
           !accountIds.length ||
           copiesOf(ctx, r.message_id).some((c) => accountIds.includes(c.account_id)),
       )
-      .filter((r) => matchFilter(ctx, r.message_id, filter, direction, folder))
+      .filter((r) => matchFilter(ctx, r.message_id, filter, direction, folder, accountIds))
       .map((r) => listItem(ctx, r, names));
     return { items, next: null };
   }
 
   const params: unknown[] = [];
-  let where = "1=1";
+  let where = `1=1 AND ${NOT_DRAFT_SQL}`;
+  // 垃圾邮件不是「邮件」（见 NOT_JUNK_ONLY_SQL）：不给 folder 时排除「只躺在垃圾文件夹里」的。
+  // ⚠ 本段的占位符必须**紧跟其后**绑参（params 是位置绑定的，顺序错了会静默错配）
+  if (!folder?.length) {
+    where += ` AND ${NOT_JUNK_ONLY_SQL}`;
+    params.push(...JUNK_NAMES_LOWER);
+  }
   if (accountIds.length) {
     where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND c.account_id IN (${accountIds.map(() => "?").join(", ")}))`;
     params.push(...accountIds);
@@ -265,7 +364,9 @@ function listMessages(ctx: WebmailContext, url: URL) {
   // filter 支持逗号分隔多值（交集语义，与 matchFilter 的 JS 路径同口径）
   const filters = new Set((filter ?? "").split(",").filter(Boolean));
   if (filters.has("unseen")) {
-    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND NOT ${HAS_SEEN_SQL})`;
+    where += ` AND ${unseenSql(accountIds)}`;
+    // ⚠ 限定账号时该子句才有占位符；无账号时 push 空数组是无操作（顺序也天然对齐）
+    params.push(...accountIds);
   }
   if (filters.has("flagged")) {
     where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND ${HAS_FLAGGED_SQL})`;
@@ -564,14 +665,17 @@ async function applyFlagsBatch(
 
 /**
  * 批量标已读（2026-10-05，供 /mail 的「全部标为已读」）：
- * 把**范围内可见的未读消息**的每个缺 \Seen 副本补上 \Seen。
+ * 把**范围内可见的未读消息**的每个缺 \Seen 副本补上 \Seen（含范围外账号的副本，
+ * 与单条 `applyFlags` 的「所有副本一起写」同一条红线 8）。
  *
- * 口径与列表一致：「消息级未读」= 存在任一副本缺 \Seen（`listItem.seen` / `filter=unseen`
- * 的 EXISTS 口径）——要让它变成已读，就把每个缺 \Seen 的副本都写上（含范围外账号的
- * 副本，与单条 `applyFlags` 的「所有副本一起写」同一条红线 8）。
+ * ⚠ 口径说明（2026-10-10 第六轮）：本动作的范围是**所有文件夹**里缺 \Seen 的副本
+ * （含垃圾 / 归档），而**「未读」这个筛选只认收件箱**（`UNSEEN_SQL`）——即本动作是显示口径
+ * 的**超集**。这是有意的：按钮的可用性由收件箱未读数决定（`unreadTotal`），点它就是把
+ * 未读清干净（服务商侧的垃圾未读也一并清掉，不影响本站任何显示）。若将来要收窄成
+ * 「只清收件箱」，在这里加 `AND upper(trim(c.folder)) = 'INBOX'` 即可。
  *
  * 范围 = `accountIds`（空 = 全部账号）：只计入「至少有一个副本落在这些账号里」的消息。
- * 方向 / 搜索 / 星标不参与——未读本质是收件箱概念，「全部已读」按账号范围清最为直觉。
+ * 方向 / 搜索 / 星标不参与——「全部已读」按账号范围清最为直觉。
  *
  * 性能：所选副本按账号分组、账号内再按文件夹分组，**每文件夹一次 STORE**（见 setSeenBatch），
  * 每账号一次连接。单账号失败只记 skipped，不阻断其它账号（与批量写操作的整体风格一致）。
@@ -1108,16 +1212,36 @@ export function createApiServer(ctx: WebmailContext): Server {
         return json(res, 200, { items: listContacts(ctx.db, q) });
       }
 
-      // ---- 草稿（2026-10-06）：写信页自动保存 / 草稿箱 ----
-      // 列表（按最近更新倒序）：写信页据此找回同一原信 / 新建的最新草稿
+      // ---- 草稿（2026-10-06 建，2026-10-10 改为「服务商草稿文件夹 = 唯一事实源」）----
+      // 列表按最近更新倒序。两种读法各有用处：
+      // - `?refresh=1`：草稿箱打开时用——**去服务商那边对一遍**（手机写的新草稿由此进来、
+      //   服务端删掉的从缓存清掉）。这是唯一的同步点；
+      // - 不带 refresh：只读本地缓存——写信页高频调它来找回"同一原信的最新草稿"，
+      //   每次登录一遍账号的代价不能压在那里。
+      // `?kind=&kindRef=` 让写信页只取它关心的那一封，不必把整个草稿箱拉过去。
       if (req.method === "GET" && path === "/drafts") {
-        return json(res, 200, { items: listDrafts(ctx.db) });
+        let errors: { accountId: string; error: string }[] = [];
+        if (url.searchParams.get("refresh") === "1") {
+          const r = await refreshDraftBox(ctx);
+          errors = r.errors;
+        }
+        const kind = url.searchParams.get("kind")?.trim();
+        const kindRef = url.searchParams.get("kindRef")?.trim();
+        const items =
+          kind || kindRef ? findDrafts(ctx.db, { kind, kindRef }) : listDrafts(ctx.db);
+        return json(res, 200, { items, errors });
       }
       if (req.method === "POST" && path === "/drafts") {
         const body = (await readBody(req)) as DraftInput;
         return json(res, 201, createDraft(ctx.db, body ?? {}));
       }
       const draftMatch = path.match(/^\/drafts\/([^/]+)$/);
+      // 打开一封草稿：服务器草稿的正文/附件在这里**按需抓原文解析**（列表只用 envelope）
+      if (draftMatch && req.method === "GET") {
+        const draft = await readDraft(ctx, decodeURIComponent(draftMatch[1]));
+        if (!draft) return json(res, 404, { error: "草稿不存在" });
+        return json(res, 200, draft);
+      }
       if (draftMatch && req.method === "PUT") {
         const body = (await readBody(req)) as DraftInput;
         const updated = updateDraft(ctx.db, decodeURIComponent(draftMatch[1]), body ?? {});

@@ -171,4 +171,57 @@ describe("mailagentd 抓取与索引", () => {
     expect(searchMessages(db, "面试")).toHaveLength(1);
     expect(searchMessages(db, "学术动态")).toHaveLength(0);
   });
+
+  /**
+   * 草稿不是邮件（2026-10-10）：带 `\Draft` 标记的副本**不入索引**。
+   *
+   * 起因：草稿被当成普通邮件索引之后，「全部」列表里混进了几十上百封草稿（用户 QQ 账号
+   * 有 141 封存活草稿，最早 2014 年）。展示层另有 `NOT_DRAFT_SQL` 兜底，这里管的是
+   * **别把它们写进库**（同步白名单里勾了草稿文件夹也不怕）。
+   *
+   * ⚠ 这条用例真正盯的是**水位线**：跳过的草稿必须仍被算作"已处理"，否则水位线会停在
+   *   它前面，下一轮又捞出来——表现为"每次同步都重复抓同一封、永远同步不完"。
+   */
+  it("草稿（\Draft 标记）不入索引，且不卡住水位线", async () => {
+    const client = await connectAccount(account, cred);
+    let draftUid: number;
+    try {
+      const res = await client.append(
+        "INBOX",
+        Buffer.from(
+          "From: test@local\r\nTo: someone@example.org\r\nSubject: 一封草稿\r\n" +
+            "Message-ID: <draft-fetch-test@local>\r\n\r\n写了一半\r\n"
+        ),
+        ["\\Draft"]
+      );
+      expect(res).not.toBe(false);
+      draftUid = (res as { uid: number }).uid;
+    } finally {
+      await client.logout().catch(() => {});
+    }
+
+    const before = count("SELECT COUNT(*) AS n FROM copies");
+    const r = await syncAccount(db, dataDir, account, cred);
+    // 不计入 fetched（它不是"收到的邮件"）
+    expect(r[0].fetched).toBe(0);
+    expect(count("SELECT COUNT(*) AS n FROM copies")).toBe(before);
+    expect(
+      count(`SELECT COUNT(*) AS n FROM copies WHERE uid = ${draftUid}`),
+      "草稿不该有副本行"
+    ).toBe(0);
+    expect(
+      count(`SELECT COUNT(*) AS n FROM messages WHERE message_id = 'mid:draft-fetch-test@local'`)
+    ).toBe(0);
+
+    // 水位线必须已经越过它：再同步一轮不会重新捞出来（也不会重复计数）
+    const watermark = (
+      db.prepare("SELECT last_seen_uid AS u FROM folders WHERE account_id = ? AND path = 'INBOX'").get(
+        account.id
+      ) as { u: number }
+    ).u;
+    expect(watermark).toBeGreaterThanOrEqual(draftUid);
+    const again = await syncAccount(db, dataDir, account, cred);
+    expect(again[0].fetched).toBe(0);
+    expect(count("SELECT COUNT(*) AS n FROM copies")).toBe(before);
+  });
 });

@@ -125,7 +125,14 @@ function migrate(db: Db): void {
       server_account TEXT NOT NULL DEFAULT '',
       server_folder TEXT NOT NULL DEFAULT '',
       server_uid INTEGER,
-      server_uidvalidity TEXT NOT NULL DEFAULT ''
+      server_uidvalidity TEXT NOT NULL DEFAULT '',
+      -- 解析缓存（2026-10-10 阶段 1：服务商草稿文件夹为唯一事实源）：
+      -- 服务器草稿的主旨/地址来自 IMAP envelope（便宜），正文与附件要抓原文才知道——
+      -- server_parsed = 1 表示已经解析过这份原文；attachments_json 是附件清单缓存。
+      -- ⚠ IMAP 的消息内容**不可变**（改草稿 = 删旧 + APPEND 新，UID 必变），所以
+      --   「按 (账号, 文件夹, UID, uidvalidity) 缓存 = 永远不会读到过期正文」。
+      server_parsed INTEGER NOT NULL DEFAULT 0,
+      attachments_json TEXT NOT NULL DEFAULT '[]'
     );
   `);
 
@@ -145,6 +152,12 @@ function migrate(db: Db): void {
     "server_uidvalidity",
     "server_uidvalidity TEXT NOT NULL DEFAULT ''"
   );
+  addColumnIfMissing(db, "drafts", "server_parsed", "server_parsed INTEGER NOT NULL DEFAULT 0");
+  // 自愈式的"已读内容"标记（**不靠"列刚加上"这个一次性信号**——那样只在某个特定版本
+  // 启动时生效，之后永远补不上）：本地表里已经有正文的行，内容就是已知的（站内写的草稿、
+  // 或已经按需解析过的服务器草稿），标成已读即可。**未解析的服务器草稿 body 为空**，不受影响。
+  db.exec("UPDATE drafts SET server_parsed = 1 WHERE server_parsed = 0 AND body <> ''");
+  addColumnIfMissing(db, "drafts", "attachments_json", "attachments_json TEXT NOT NULL DEFAULT '[]'");
   if (addedServerDirty) {
     // 存量草稿一次性标记待投递：它们建于镜像功能上线前，阿里云网页端还看不到
     // （只在本分支执行——全新库的 CREATE TABLE 已带该列，不会走到这里）

@@ -47,14 +47,20 @@ describe("toFolderInfo / suggestSyncFolders", () => {
     expect(byPath.get("已发送")?.specialUseSource).toBe("name");
   });
 
-  it("推荐同步集 = INBOX + 特殊用途文件夹（顺序：已发送 → 草稿 → 已删除 → 垃圾）", () => {
-    expect(suggestSyncFolders(toFolderInfo(ALIYUN_LIST))).toEqual([
-      "INBOX",
-      "已发送",
-      "草稿",
-      "已删除邮件",
-      "垃圾邮件",
+  it("推荐同步集 = INBOX + 已发送 / 垃圾邮件（⚠ 刻意不含草稿与已删除，见 SUGGESTED_USES）", () => {
+    // 草稿：站内草稿是本地的表 + 单向镜像写回服务器，抓回来只会让镜像出去的草稿以邮件身份
+    //   回流到「全部」；已删除：删除 = MOVE 进 \Trash，抓回来等于"删了又自己回来"。
+    expect(suggestSyncFolders(toFolderInfo(ALIYUN_LIST))).toEqual(["INBOX", "已发送", "垃圾邮件"]);
+  });
+
+  it("归档在推荐集里（顺序：已发送 → 垃圾 → 归档）", () => {
+    const info = toFolderInfo([
+      { path: "INBOX", name: "INBOX", delimiter: "/" },
+      { path: "Archives", name: "Archives", delimiter: "/", specialUse: "\\Archive" },
+      { path: "Junk", name: "Junk", delimiter: "/", specialUse: "\\Junk" },
+      { path: "Sent Messages", name: "Sent Messages", delimiter: "/", specialUse: "\\Sent" },
     ]);
+    expect(suggestSyncFolders(info)).toEqual(["INBOX", "Sent Messages", "Junk", "Archives"]);
   });
 
   it("\\Noselect 的容器节点不进推荐集（也不标 selectable）", () => {
@@ -145,12 +151,28 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
   beforeAll(async () => {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "accounts.json"), JSON.stringify({ accounts: [] }));
+    // 注册表放两个账号（只为 `/accounts` 的未读角标口径用例；本套用例不发任何 IMAP 请求）
+    const accounts = ["acc1", "acc2"].map((id) => ({
+      id,
+      displayName: id,
+      email: `${id}@local`,
+      provider: "test",
+      color: "sky",
+      imapHost: "127.0.0.1",
+      imapPort: 1,
+      imapSecure: false,
+      smtpHost: "127.0.0.1",
+      smtpPort: 1,
+      smtpSecure: false,
+      folders: ["INBOX"],
+      enabled: true,
+    }));
+    writeFileSync(join(dir, "accounts.json"), JSON.stringify({ accounts }));
     writeFileSync(join(dir, "credentials.json"), JSON.stringify({}));
     ctx = {
       db: openDb(join(dir, "webmail.db")),
       dataDir: dir,
-      accounts: new Map(),
+      accounts: new Map(accounts.map((a) => [a.id, a])),
       credentials: new Map(),
       remoteImageDomains: [],
       syncStates: new Map(),
@@ -170,6 +192,10 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
       { accountId: "acc1", folder: "INBOX", uid: 4 },
       { accountId: "acc2", folder: "已发送", uid: 8 },
     ]);
+    // 草稿（2026-10-10 阶段 0）：服务器草稿文件夹里的信被同步索引进来时，绝不能当邮件出现
+    seed("mid:draft@x", "2026-10-06T00:00:00Z", [
+      { accountId: "acc1", folder: "草稿", uid: 9, flags: "\\Draft \\Seen" },
+    ]);
 
     server = createApiServer(ctx);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -181,9 +207,116 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("不给 folder 时返回全部邮件（合并视图）", async () => {
+  it("不给 folder 时返回全部邮件（合并视图），**草稿与垃圾都不算邮件**", async () => {
     const r = await list("limit=50");
-    expect(r.items.length).toBe(5);
+    // 库里 6 封：mid:draft@x 带 \Draft 标记、mid:junk@x 与 mid:acc2junk@x 只躺在「垃圾邮件」里
+    // → 合并视图只剩 3 封（2026-10-10 第六轮：垃圾邮件不属于「邮件」，只能在「垃圾」tab 里看）
+    expect(r.items.map((i) => i.messageId).sort()).toEqual([
+      "mid:both@x",
+      "mid:inbox@x",
+      "mid:sent@x",
+    ]);
+    expect(r.items.map((i) => i.messageId)).not.toContain("mid:draft@x");
+    expect(r.items.map((i) => i.messageId)).not.toContain("mid:junk@x");
+    // 搜索路径（JS matchFilter）同口径：垃圾邮件与草稿都不该被搜出来
+    const searched = await list(`q=${encodeURIComponent("主题")}`);
+    expect(searched.items.map((i) => i.messageId)).not.toContain("mid:junk@x");
+    expect(searched.items.map((i) => i.messageId)).not.toContain("mid:draft@x");
+  });
+
+  /**
+   * 未读口径（2026-10-10 第六轮，用户报障）：**未读 = 收件箱未读**，与 `/accounts` 的
+   * `unread`、底栏统计、大标题角标四处同一个数。旧口径「存在任一副本无 \Seen」会把垃圾箱
+   * 里的未读算进来（用户账号 Junk 正好 5 封未读 → 开关写 2、点开列出 7 封）。
+   * ⚠ 反向验证：把 UNSEEN_SQL 改回旧口径，本用例三条断言立刻变红。
+   */
+  it("未读 = 收件箱未读：垃圾里的未读副本不算，按垃圾文件夹筛也筛不出未读", async () => {
+    // 合并视图里收件箱未读 = mid:inbox@x 与 mid:both@x（mid:sent@x 是已读的已发送）
+    const unseen = await list("filter=unseen");
+    expect(unseen.items.map((i) => i.messageId).sort()).toEqual(["mid:both@x", "mid:inbox@x"]);
+    // 只躺在垃圾里的 mid:junk@x 虽然未读，但不是「收件箱未读」→ 不进未读筛选
+    expect(unseen.items.map((i) => i.messageId)).not.toContain("mid:junk@x");
+    // 显式按垃圾文件夹 + 未读 = 空（前端「垃圾」tab 据此禁用「未读」开关）
+    const junkUnseen = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}&filter=unseen`);
+    expect(junkUnseen.items).toEqual([]);
+    // 搜索路径同口径
+    const searched = await list(`q=${encodeURIComponent("主题")}&filter=unseen`);
+    expect(searched.items.map((i) => i.messageId).sort()).toEqual(["mid:both@x", "mid:inbox@x"]);
+  });
+
+  /**
+   * 用户报障的**正面契约**（2026-10-10 第六轮）：**开关上的数字 == 打开后列出的条数**。
+   * 数字来自 `/accounts` 的 `unread`（每个副本都算，只数 INBOX），条数来自
+   * `/messages?filter=unseen`（消息去重）——两处必须同一个口径，否则就是用户遇到的
+   * 「开关写 2、点开列出 7 封」。逐账号比对（全局求和与消息数在"同一封同时进了两个
+   * 账号收件箱"时本来就不等：那是两个不同的量，实测用户数据里这种组合为 0 条）。
+   * ⚠ 反向验证：把 UNSEEN_SQL 改回「任一副本无 \Seen」，acc1 立刻 2 → 3（垃圾那封进来了）。
+   */
+  it("账号角标的未读数 == 该账号未读筛选的条数（逐账号同口径）", async () => {
+    // 造一封 acc2 的 INBOX 未读，避免第二个账号退化成「0 == 0」的空断言
+    // ⚠ 用后即清必须放 finally：断言先红时若跳过清理，泄漏的桩数据会把后面的用例一起带红
+    //   （2026-10-10 反向验证时正是这样多红了一条，掩盖了真正的失败点）
+    seed("mid:acc2inbox@x", "2026-10-08T00:00:00Z", [
+      { accountId: "acc2", folder: "INBOX", uid: 21 },
+    ]);
+    try {
+      const accounts = (await (await fetch(`${base}/accounts`)).json()) as {
+        id: string;
+        unread: number;
+      }[];
+      const unread = new Map(accounts.map((a) => [a.id, a.unread]));
+      // acc1 = mid:inbox@x + mid:both@x（垃圾里的 mid:junk@x 不算）；acc2 = 刚造的那封
+      expect(unread.get("acc1")).toBe(2);
+      expect(unread.get("acc2")).toBe(1);
+      // ⚠ 账号范围要连「未读」一起限定：mid:both@x 的未读 INBOX 副本在 acc1，
+      //   不该因为它另有一份 acc2 的副本就出现在「acc2 + 未读」里（否则角标 0、列表 1）
+      expect((await list("account=acc2&filter=unseen")).items.map((i) => i.messageId)).toEqual([
+        "mid:acc2inbox@x",
+      ]);
+      for (const a of accounts) {
+        const r = await list(`account=${a.id}&filter=unseen`);
+        expect(
+          r.items.length,
+          `账号 ${a.id}：角标写 ${a.unread}，未读筛选却列出 ${r.items.length} 封`,
+        ).toBe(a.unread);
+      }
+    } finally {
+      for (const id of ["mid:acc2inbox@x"]) {
+        ctx.db.prepare("DELETE FROM copies WHERE message_id = ?").run(id);
+        ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(id);
+        ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(id);
+      }
+    }
+  });
+
+  it("同时有 INBOX 与垃圾副本的邮件仍算正常邮件（存在非垃圾副本即可）", async () => {
+    // 实测数据里这种组合为 0 条，但判定必须写成「存在非垃圾副本」而不是「不存在垃圾副本」
+    seed("mid:inboxjunk@x", "2026-10-07T00:00:00Z", [
+      { accountId: "acc1", folder: "垃圾邮件", uid: 11 },
+      { accountId: "acc1", folder: "INBOX", uid: 12 },
+    ]);
+    try {
+      const r = await list("limit=50");
+      expect(r.items.map((i) => i.messageId)).toContain("mid:inboxjunk@x");
+      // 它同时也是「收件箱未读」
+      const unseen = await list("filter=unseen");
+      expect(unseen.items.map((i) => i.messageId)).toContain("mid:inboxjunk@x");
+    } finally {
+      ctx.db.prepare("DELETE FROM copies WHERE message_id = ?").run("mid:inboxjunk@x");
+      ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run("mid:inboxjunk@x");
+      ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run("mid:inboxjunk@x");
+    }
+  });
+
+  it("草稿在任何视图与搜索里都不出现（含显式按它的文件夹筛）", async () => {
+    // 即使有人把「草稿」勾进同步白名单、前端又按该文件夹筛，草稿也不该以邮件身份返回
+    const byFolder = await list(`folder=${encodeURIComponent("acc1|草稿")}`);
+    expect(byFolder.items).toEqual([]);
+    // 搜索走 JS 路径（matchFilter），同口径
+    const bySearch = await list(`q=${encodeURIComponent("主题 mid:draft")}`);
+    expect(bySearch.items).toEqual([]);
+    // 方向视图 / 未读组合里同样没有它
+    expect((await list("direction=received")).items.map((i) => i.messageId)).not.toContain("mid:draft@x");
   });
 
   it("纯路径：命中所有账号里该文件夹的副本", async () => {
@@ -220,9 +353,11 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
     expect(acc2Sent.items.map((i) => i.messageId)).toEqual(["mid:both@x"]);
   });
 
-  it("文件夹 + 未读组合筛选（与 SQL 口径一致）", async () => {
+  it("文件夹 + 未读组合筛选：垃圾文件夹里没有「收件箱未读」这回事（= 空）", async () => {
+    // 2026-10-10 第六轮：未读只认 INBOX 副本，而这条查询限定在垃圾文件夹里 → 交集必空。
+    // 前端因此不在「垃圾」tab 里提供「未读」开关（禁用）。
     const r = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}&filter=unseen`);
-    expect(r.items.map((i) => i.messageId)).toEqual(["mid:junk@x"]);
+    expect(r.items).toEqual([]);
   });
 
   it("搜索路径（q）与 SQL 路径同口径：限定文件夹后结果一致", async () => {

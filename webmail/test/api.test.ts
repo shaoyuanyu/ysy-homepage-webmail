@@ -249,7 +249,9 @@ describe("webmaild HTTP API", () => {
     expect(byId.get("mid:w01@test.local")).toBe(false);
   });
 
-  it("状态筛选：unseen 排除全副本已读，flagged 只留加星；恢复后计数复原", async () => {
+  it("状态筛选：unseen = 收件箱未读（标已读即消失），flagged 只留加星；恢复后计数复原", async () => {
+    // 种子 6 封都有 INBOX 副本且都未读（2026-10-10 第六轮起 unseen 只认 INBOX 副本，
+    // 见 api.ts 的 UNSEEN_SQL；垃圾文件夹里的未读不算——那条用例在 folders.test.ts）
     const unseen0 = (await (await api("/messages?filter=unseen")).json()) as {
       items: { messageId: string }[];
     };
@@ -356,11 +358,13 @@ describe("webmaild HTTP API", () => {
     // received = 种子 6 封（w01..w06 都有 INBOX 副本）
     expect(received.items.length).toBe(6);
 
-    // 组合筛选：方向与状态互相独立、可叠加——未读 + 发件 = 刚投的这封（未读、发件）
+    // 组合筛选：方向与状态互相独立、可叠加——但「未读」= **收件箱未读**（2026-10-10 第六轮），
+    // 而发件的副本全在「已发送」里、没有 INBOX 副本 → 交集恒为空。
+    // （前端也据此在「发件」tab 里禁用「未读」开关，见 mail-client.tsx 的 unseenActive）
     const unseenSent = (await (await api("/messages?filter=unseen&direction=sent")).json()) as {
       items: { messageId: string }[];
     };
-    expect(unseenSent.items.map((i) => i.messageId)).toEqual(["mid:w07@test.local"]);
+    expect(unseenSent.items).toEqual([]);
 
     // 清理：IMAP 里删掉这封，索引行也直接清掉（两步都要）。
     // ⚠ 不能只删 IMAP 再 /sync：同步不做「删除检测」（只在 UIDVALIDITY 变化时重建索引），

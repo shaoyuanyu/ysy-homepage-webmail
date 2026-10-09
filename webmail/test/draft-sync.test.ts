@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { simpleParser } from "mailparser";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { createApiServer } from "../src/api.js";
 import { mirrorDrafts } from "../src/draft-mirror.js";
 import { makeContext, type TestContext } from "./context.js";
@@ -67,6 +68,8 @@ async function waitFor<T>(fn: () => Promise<T>, ok: (v: T) => boolean, timeoutMs
 }
 
 beforeAll(async () => {
+  // 草稿箱刷新有 60s TTL（来回切 tab 不必反复跨境 FETCH）；用例里每次都要求真刷
+  process.env.WEBMAIL_DRAFT_REFRESH_TTL_MS = "0";
   dovecot = startDovecot("draft");
   await waitReady(dovecot);
   sink = await startSmtpSink();
@@ -201,5 +204,191 @@ describe("webmaild 草稿镜像（本地 → 服务器草稿箱）", () => {
     await api(`/drafts/${created.id}`, { method: "DELETE" });
     // 新副本已被删除路径清掉；旧副本（uidvalidity 不符时删除路径也会跳过）残留一封——
     // 这正是「宁多勿误删」的代价，测试末端用管理方式（UILess）清场由容器销毁承担
+  });
+});
+
+/**
+ * 草稿箱（2026-10-10 阶段 1：**服务商的草稿文件夹是唯一事实源**）。
+ *
+ * 上面那组是"本地 → 服务器"的提交方向；这一组是反向：别的客户端（手机/网页端）写的草稿
+ * 必须出现在站内草稿箱里，而且**打开时才去抓原文**（列表只用 IMAP envelope，便宜）。
+ */
+describe("草稿箱：服务商草稿文件夹 → 站内", () => {
+  /** 直连 Dovecot 投一封"别的客户端写的"草稿（模拟手机端），返回 uid */
+  async function appendExternal(opts: {
+    subject: string;
+    text: string;
+    to?: string;
+    inReplyTo?: string;
+    flags?: string[];
+    attachment?: { filename: string; content: Buffer; contentType: string };
+    kindHeader?: string;
+    refHeader?: string;
+  }): Promise<number> {
+    const headers: Record<string, string> = {};
+    if (opts.kindHeader) headers["X-Webmail-Draft-Kind"] = opts.kindHeader;
+    if (opts.refHeader) headers["X-Webmail-Draft-Ref"] = opts.refHeader;
+    const composer = new MailComposer({
+      from: "test@local",
+      to: opts.to ?? "someone@example.org",
+      subject: opts.subject,
+      text: opts.text,
+      inReplyTo: opts.inReplyTo,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+      attachments: opts.attachment
+        ? [{ filename: opts.attachment.filename, content: opts.attachment.content, contentType: opts.attachment.contentType }]
+        : undefined,
+    });
+    const raw = await composer.compile().build();
+    const client = await connectUser(dovecot, "test", "test");
+    try {
+      const res = await client.append("Drafts", raw, opts.flags ?? ["\\Draft"]);
+      expect(res).not.toBe(false);
+      return (res as { uid: number }).uid;
+    } finally {
+      await client.logout().catch(() => {});
+    }
+  }
+
+  const listDrafts = async () => {
+    const res = await api("/drafts?refresh=1");
+    expect(res.status).toBe(200);
+    return (await res.json()) as {
+      items: {
+        id: string;
+        accountId: string;
+        kind: string;
+        kindRef: string;
+        to: string;
+        subject: string;
+        body: string;
+        contentLoaded: boolean;
+        attachments: { filename: string; size: number }[];
+      }[];
+      errors: { accountId: string; error: string }[];
+    };
+  };
+
+  it("别的客户端写的草稿能进站内草稿箱；列表只有 envelope，打开时才解析正文", async () => {
+    const uid = await appendExternal({
+      subject: "手机写了一半",
+      text: "第一段还没写完",
+      to: "colleague@example.org",
+    });
+
+    const { items, errors } = await listDrafts();
+    expect(errors).toEqual([]);
+    const hit = items.find((d) => d.accountId === "acc1" && d.subject === "手机写了一半");
+    expect(hit, "外部草稿必须出现在草稿箱里").toBeTruthy();
+    // 列表阶段：主题/收件人来自 envelope；正文**还没读**
+    expect(hit!.to).toContain("colleague@example.org");
+    expect(hit!.contentLoaded).toBe(false);
+    expect(hit!.body).toBe("");
+
+    // 打开（写信页那一步）→ 抓原文解析出正文
+    const one = await api(`/drafts/${hit!.id}`);
+    expect(one.status).toBe(200);
+    const full = (await one.json()) as { body: string; contentLoaded: boolean; attachments: unknown[] };
+    expect(full.contentLoaded).toBe(true);
+    expect(full.body).toContain("第一段还没写完");
+    expect(full.attachments).toEqual([]);
+
+    // 清场：删本地 + 服务器副本
+    await api(`/drafts/${hit!.id}`, { method: "DELETE" });
+    expect((await serverDrafts()).some((d) => d.uid === uid)).toBe(false);
+  });
+
+  it("\Deleted 的僵尸草稿不显示（服务端从未 EXPUNGE 的那种）", async () => {
+    const uid = await appendExternal({
+      subject: "早就删了但没清理",
+      text: "x",
+      flags: ["\\Draft", "\\Deleted"],
+    });
+    const { items } = await listDrafts();
+    expect(items.some((d) => d.subject === "早就删了但没清理")).toBe(false);
+    // 不显示 ≠ 动了服务器：那一封还在（我们只读）
+    expect((await serverDrafts()).some((d) => d.uid === uid)).toBe(true);
+  });
+
+  it("归属键：自定义头往返；外部草稿按 In-Reply-To 推成「回复」", async () => {
+    // 站内写的转发草稿（kind=forward 推不出来，只能靠自己写的头往返）
+    const created = (await (
+      await api("/drafts", {
+        method: "POST",
+        body: JSON.stringify({
+          accountId: "acc1",
+          to: "eve@example.org",
+          subject: "转发草稿",
+          body: "转给你",
+          kind: "forward",
+          kindRef: "<orig@local>",
+        }),
+      })
+    ).json()) as { id: string };
+    await mirrorDrafts(tc.ctx, { quietMs: 0 });
+    const afterPush = await listDrafts();
+    const mine = afterPush.items.find((d) => d.id === created.id);
+    expect(mine?.kind).toBe("forward");
+    expect(mine?.kindRef).toBe("<orig@local>");
+
+    // 手机端写的回复草稿：只有 In-Reply-To，没有自定义头
+    await appendExternal({
+      subject: "Re: 讨论",
+      text: "我回一下",
+      inReplyTo: "<thread@example.org>",
+    });
+    const list = await listDrafts();
+    const ext = list.items.find((d) => d.subject === "Re: 讨论");
+    expect(ext?.kind).toBe("reply");
+    expect(ext?.kindRef).toBe("<thread@example.org>");
+
+    await api(`/drafts/${created.id}`, { method: "DELETE" });
+    if (ext) await api(`/drafts/${ext.id}`, { method: "DELETE" });
+  });
+
+  it("保存站内修改时保留原件附件（不能因为站内不能编辑附件就把它们弄丢）", async () => {
+    const uid = await appendExternal({
+      subject: "带附件的草稿",
+      text: "正文里说了附件",
+      attachment: { filename: "report.txt", content: Buffer.from("hello attachment"), contentType: "text/plain" },
+    });
+    const { items } = await listDrafts();
+    const hit = items.find((d) => d.subject === "带附件的草稿");
+    expect(hit).toBeTruthy();
+
+    // 打开 → 解析出附件清单
+    const full = (await (await api(`/drafts/${hit!.id}`)).json()) as {
+      attachments: { filename: string; size: number }[];
+    };
+    expect(full.attachments.map((a) => a.filename)).toEqual(["report.txt"]);
+
+    // 站内改正文并保存 → 提交到服务器（替换旧版）
+    const put = await api(`/drafts/${hit!.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ subject: "带附件的草稿（改）", body: "改过的正文" }),
+    });
+    expect(put.status).toBe(200);
+    const r = await mirrorDrafts(tc.ctx, { quietMs: 0 });
+    expect(r.failed).toBe(0);
+
+    // 服务器上只剩一封，且附件还在、正文是新版
+    const left = (await serverDrafts()).filter((d) => d.subject === "带附件的草稿（改）");
+    expect(left).toHaveLength(1);
+    const client = await connectUser(dovecot, "test", "test");
+    try {
+      await client.mailboxOpen("Drafts", { readOnly: true });
+      const msg = await client.fetchOne(String(left[0].uid), { source: true }, { uid: true });
+      expect(msg).toBeTruthy();
+      const parsed = await simpleParser((msg as { source: Buffer }).source);
+      expect(parsed.attachments.map((a) => a.filename)).toEqual(["report.txt"]);
+      expect(parsed.attachments[0].content.toString()).toBe("hello attachment");
+      expect(parsed.text ?? "").toContain("改过的正文");
+    } finally {
+      await client.logout().catch(() => {});
+    }
+    // 旧那封（带旧主题）已被替换
+    expect((await serverDrafts()).some((d) => d.uid === uid)).toBe(false);
+
+    await api(`/drafts/${hit!.id}`, { method: "DELETE" });
   });
 });

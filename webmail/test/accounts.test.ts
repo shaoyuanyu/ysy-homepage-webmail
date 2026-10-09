@@ -261,11 +261,15 @@ describe("账号管理：增删（真实 dovecot + smtp sink）", () => {
     });
     expect(res.status).toBe(201);
     const summary = (await res.json()) as { id: string; folders: string[] };
-    // dovecot 测试容器：INBOX / Sent(\Sent) / Drafts(\Drafts) / Trash(\Trash) 带 special_use
+    // dovecot 测试容器：INBOX / Sent(\Sent) / Drafts(\Drafts) / Trash(\Trash) / Junk(\Junk)
     expect(summary.folders[0]).toBe("INBOX");
     expect(summary.folders).toContain("Sent");
-    expect(summary.folders).toContain("Drafts");
-    expect(summary.folders).toContain("Trash");
+    expect(summary.folders).toContain("Junk");
+    // ⚠ 草稿与已删除**刻意不进推荐集**（2026-10-10，见 folders.ts 的 SUGGESTED_USES）：
+    //   草稿在站内是本地表 + 单向镜像（抓回来只是让镜像出去的草稿回流到「全部」）；
+    //   已删除 = MOVE 进去的，抓回来等于"删了又自己回来"
+    expect(summary.folders).not.toContain("Drafts");
+    expect(summary.folders).not.toContain("Trash");
     const onDisk = readAccounts(tc.dir).accounts.find((a) => a.email === "auto@local");
     expect(onDisk?.folders).toEqual(summary.folders);
     // 清理：后续用例（「删到只剩一个 409」）依赖账号数量，别把这个账号留下
@@ -307,7 +311,8 @@ describe("账号管理：增删（真实 dovecot + smtp sink）", () => {
     expect(preview.status).toBe(200);
     const pv = (await preview.json()) as { folders: { path: string }[]; suggested: string[] };
     expect(pv.folders.map((f) => f.path)).toContain("Sent");
-    expect(pv.suggested).toContain("Drafts");
+    expect(pv.suggested).toContain("Junk");
+    expect(pv.suggested).not.toContain("Drafts");
     expect(readAccounts(tc.dir).accounts.length).toBe(before);
 
     // 预览：密码错 → 502，且不落盘

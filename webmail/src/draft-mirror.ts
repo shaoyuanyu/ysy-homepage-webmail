@@ -1,4 +1,6 @@
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
+import { simpleParser } from "mailparser";
+import type { ImapFlow } from "imapflow";
 import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
 import type { WebmailContext } from "./api.js";
@@ -7,12 +9,15 @@ import type { WebmailAccount } from "./types.js";
 import { detectDraftsFolder } from "./write.js";
 
 /**
- * 草稿 → 服务器「草稿」文件夹镜像（2026-10-06）。
+ * 草稿暂存 → 服务商「草稿」文件夹的**提交层**（2026-10-06 建，2026-10-10 改定位）。
  *
- * 起因（用户报障）：本地草稿只存在 webmaild 的 SQLite 里，阿里云官方网页端
- * 完全看不到——「数据和邮件服务器同步有问题」。修法 = 把每个草稿同时以
- * RFC822 消息投递到账号服务商的草稿文件夹（`\Drafts` / 草稿，见 detectDraftsFolder），
- * 本地更新后替换服务器上的上一版，删除 / 发送后清掉服务器副本。
+ * 现在服务商的草稿文件夹是**用户可见的唯一草稿箱**（见 `draft-store.ts`）：写信页 500ms
+ * 防抖只写本地 `drafts` 表（`server_dirty = 1`），由本模块在"安静 ≥10s"后把这一版
+ * APPEND 上去、并**彻底删除**它的上一版——本地那一行随之变成这份服务器草稿的解析缓存。
+ * 删除 / 发送后同样清掉服务器副本（`deleteServerDraftCopy`）。
+ *
+ * ⚠ 因此"镜像"这个名字现在只是个历史称呼：它不是第二份数据，而是**提交动作**本身；
+ *   本地暂存存在的唯一理由是"防抖 + 断网也能继续写"。
  *
  * 时序模型（与 `runSync` 相同的「周期性扫描」风格，不做逐次请求触发的定时器）：
  * - 本地每次保存（POST/PUT /drafts）只把 `server_dirty` 置 1；
@@ -42,6 +47,8 @@ export interface DraftServerRef {
 
 interface MirrorRow {
   id: string;
+  kind: string;
+  kind_ref: string;
   account_id: string;
   to_text: string;
   cc_text: string;
@@ -56,6 +63,8 @@ interface MirrorRow {
   server_folder: string;
   server_uid: number | null;
   server_uidvalidity: string;
+  /** 解析缓存里的附件清单（非空 = 替换时必须把原件的附件原样带过去） */
+  attachments_json: string;
 }
 
 /** 安静期：草稿最后一次更新后至少静置这么久才投递服务器（合并连续自动保存） */
@@ -96,9 +105,21 @@ export function readDraftServerRef(db: Db, id: string): DraftServerRef | null {
  *   留给发送；地址解析由 MailComposer 承担）
  * - From 显示名用 senderName（与发送路径同一规则，见 send.ts）
  */
-async function buildDraftRaw(account: WebmailAccount, row: MirrorRow): Promise<Buffer> {
+async function buildDraftRaw(
+  account: WebmailAccount,
+  row: MirrorRow,
+  keepAttachments: { filename: string; contentType: string; content: Buffer }[]
+): Promise<Buffer> {
   const domain = account.email.split("@")[1] ?? "localhost";
   const references = JSON.parse(row.references_json) as string[];
+  // 归属键（"这封草稿是给哪封信的回复/转发"）本地才有，MIME 里没字段 → 自己带两个头，
+  // 解析侧照原样读回（draft-store.ts 的 draftKeyFromParsed）。丢了就退化成"全新草稿"。
+  const headers: Record<string, string> = {};
+  if (row.read_receipt === 1) headers["Disposition-Notification-To"] = account.email;
+  if (row.kind !== "new") {
+    headers["X-Webmail-Draft-Kind"] = row.kind;
+    if (row.kind_ref) headers["X-Webmail-Draft-Ref"] = row.kind_ref;
+  }
   const composer = new MailComposer({
     from: account.senderName ? `"${account.senderName}" <${account.email}>` : account.email,
     to: row.to_text || undefined,
@@ -108,10 +129,54 @@ async function buildDraftRaw(account: WebmailAccount, row: MirrorRow): Promise<B
     text: row.body,
     inReplyTo: row.in_reply_to || undefined,
     references: references.length > 0 ? references : undefined,
-    headers: row.read_receipt === 1 ? { "Disposition-Notification-To": account.email } : undefined,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
+    // 原件带的附件原样带过去（站内还不能编辑附件，但**绝不能因为保存就把它们弄丢**）
+    attachments:
+      keepAttachments.length > 0
+        ? keepAttachments.map((a) => ({
+            filename: a.filename,
+            contentType: a.contentType,
+            content: a.content,
+          }))
+        : undefined,
     messageId: `<draft-${row.id}@${domain}>`,
   });
   return composer.compile().build();
+}
+
+/**
+ * 从**即将被替换掉的那一版服务器草稿**里取出附件（保存草稿时原样保留）。
+ *
+ * 为什么要重新抓一遍：附件字节不进本地 SQLite（可能几十 MB），本地只缓存清单
+ * （`attachments_json`），所以替换前回服务器把原件读回来。
+ * ⚠ 任何一步失败都**抛错中止这一轮提交**（留 dirty 下轮重试）——宁可晚 4 秒同步，
+ *   也不能把用户手机上加的附件悄悄删掉。
+ */
+async function readKeptAttachments(
+  client: ImapFlow,
+  row: MirrorRow,
+  folder: string,
+  uidvalidity: string
+): Promise<{ filename: string; contentType: string; content: Buffer }[]> {
+  const expected = JSON.parse(row.attachments_json || "[]") as unknown[];
+  if (expected.length === 0) return [];
+  if (
+    row.server_uid === null ||
+    row.server_folder !== folder ||
+    row.server_uidvalidity !== uidvalidity
+  ) {
+    // 找不到上一版（首次提交 / 邮箱被重建）：没有可保留的附件
+    return [];
+  }
+  const msg = await client.fetchOne(String(row.server_uid), { source: true }, { uid: true });
+  if (!msg || !msg.source) throw new Error("读取旧草稿原文失败（附件无法保留）");
+  const parsed = await simpleParser(msg.source);
+  if (parsed.attachments.length === 0) return [];
+  return parsed.attachments.map((a) => ({
+    filename: a.filename ?? "attachment",
+    contentType: a.contentType ?? "application/octet-stream",
+    content: a.content,
+  }));
 }
 
 function skipDueToBackoff(id: string): boolean {
@@ -126,7 +191,6 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
   if (!account || !cred) throw new Error(`账号未配置：${row.account_id}`);
   if (!account.enabled) return; // 停用账号不投递（留 dirty，重新启用后自愈）
 
-  const raw = await buildDraftRaw(account, row);
   await withAccountLock(account.id, async () => {
     // 加锁后复核 dirty（2026-10-07）：`row` 是加锁**之前**读到的快照，等锁期间草稿
     // 可能已被发出 / 删除 / 被上一轮镜像完成——那时 server_dirty 已归 0，再投一次就会
@@ -142,6 +206,10 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
       if (!folder) throw new Error(`账号 ${account.id} 找不到「草稿」文件夹（\\Drafts 与常见名均无）`);
       const mb = await client.mailboxOpen(folder, { readOnly: false });
       const uidvalidity = String(mb.uidValidity ?? "");
+
+      // 附件：先（在删旧版之前）把旧版里的附件读回来，才能原样带进新版本
+      const keepAttachments = await readKeptAttachments(client, row, folder, uidvalidity);
+      const raw = await buildDraftRaw(account, row, keepAttachments);
 
       // 旧版本：同一账号同一文件夹且 uidvalidity 一致才按 UID 删（不一致=邮箱被重建，跳过防误删）
       if (

@@ -14,7 +14,7 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 | `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`，`WEBMAIL_HOST` / `WEBMAIL_PORT` 可调）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接） |
 | `src/accounts.ts` | 账号增删（4.11）：`normalizeAccountInput` 纯校验/归一 + `testAccountConnection`（IMAP 登录 + SMTP verify）+ `addAccount` / `deleteAccount`（原子落盘、失败回滚） |
 | `src/contacts.ts` | 通讯录 CRUD + 自动收录（4.10）|
-| `src/folders.ts` | 文件夹清单（4.15）：IMAP `LIST` → `{path,name,specialUse,selectable}`；`suggestSyncFolders`（INBOX + 已发送/草稿/已删除/垃圾）供新增账号预填 |
+| `src/folders.ts` | 文件夹清单（4.15）：IMAP `LIST` → `{path,name,specialUse,selectable}`；`suggestSyncFolders`（INBOX + 已发送/垃圾/归档；⚠ 刻意不含草稿与已删除，见 `SUGGESTED_USES` 注记）供新增账号预填 |
 | `src/attachment.ts` | 附件响应头决策（4.15 安全）：类型白名单（图片不含 SVG + text/plain）才可原样 inline，其余降级 octet-stream + attachment；附 nosniff / CSP |
 | `src/source.ts` | 原文按需补取（4.15）：truncated 的超大邮件显式取回并回填索引；`readSource` 供 .eml 下载 |
 | `src/backup.ts` | 邮件数据快照（4.15）：SQLite 在线备份 + `eml/` 硬链 + 凭据 600 + 保留 N 份；`tsx src/backup.ts` 可直接跑 |

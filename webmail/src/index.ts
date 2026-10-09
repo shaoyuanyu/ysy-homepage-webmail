@@ -6,6 +6,7 @@ import { createApiServer, isFullSyncInFlight, runSync, type WebmailContext } fro
 import { repairAccountColorsFile } from "./accounts.js";
 import { loadAccounts, loadCredentials, webmailDataDir } from "./config.js";
 import { MIRROR_SWEEP_MS, mirrorDrafts } from "./draft-mirror.js";
+import { purgeIndexedDrafts } from "./draft-store.js";
 
 const PORT = Number(process.env.WEBMAIL_PORT ?? 9710);
 /** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 WEBMAIL_HOST 覆盖（如 0.0.0.0） */
@@ -34,6 +35,20 @@ async function main() {
   const credentialsFile = loadCredentials(dataDir);
   const credentials = new Map(Object.entries(credentialsFile));
   const db = openDb(join(dataDir, "webmail.db"));
+
+  // 历史上被当成邮件索引进来的草稿清出本地库（2026-10-10 阶段 0，幂等）：
+  // 展示层由 api.ts 的 NOT_DRAFT_SQL 兜住，这里把库里的死重量（副本 + 孤儿邮件 + 全文索引 +
+  // .eml 原文）收掉。**服务器上的草稿一封都不动**。
+  try {
+    const purged = purgeIndexedDrafts(db, dataDir);
+    if (purged.copies > 0) {
+      console.log(
+        `[webmaild] 清理被误索引的草稿副本：${purged.copies} 个副本 / ${purged.messages} 封邮件本体 / ${purged.eml} 个原文文件`
+      );
+    }
+  } catch (err) {
+    console.error("[webmaild] 清理草稿副本失败（不影响启动）：", err);
+  }
 
   // 存量回填 refs_json / has_attach（4.7，幂等，不阻塞 API 起来）
   backfillRefs(db, dataDir).then((r) => {

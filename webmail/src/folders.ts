@@ -42,8 +42,24 @@ export interface FolderInfo {
   selectable: boolean;
 }
 
-/** 特殊用途的展示顺序，同时是「推荐同步」的优先级 */
+/** 特殊用途的展示顺序（清单排序用；推荐集另见 SUGGESTED_USES） */
 const SPECIAL_USE_ORDER = ["\\Sent", "\\Drafts", "\\Trash", "\\Junk", "\\Archive", "\\All"];
+
+/**
+ * **推荐同步**用的特殊用途清单——与 `SPECIAL_USE_ORDER` 刻意分开（2026-10-10）。
+ *
+ * ⚠ 为什么推荐集里没有 `\Drafts` 与 `\Trash`（用户问过"为什么没勾草稿却能看草稿"）：
+ * - `\Drafts`：站内草稿是 webmaild 自己的表（`drafts.ts`，`/mail` 的「草稿」tab 只读它），
+ *   另有单向镜像（`draft-mirror.ts`）把草稿写回服务器。把服务器的 `\Drafts` 抓进本地库
+ *   只会让**镜像出去的那份草稿以邮件的身份回流**，在「全部」里多出一堆草稿副本；
+ * - `\Trash`：删除 = `MOVE` 进 `\Trash`（`write.ts` 的 `deleteMessages`），本地副本随之清掉；
+ *   若 `\Trash` 在白名单里，下一轮同步会把刚删掉的邮件**重新抓回来**，用户看到的是
+ *   "删了又自己回来了"（列表查询对 `\Trash` 没有任何排除逻辑）。
+ *
+ * 两者都仍然可以被用户**手动**勾上（`GET /folders` 照常返回它们、前端也能勾），
+ * 只是不再作为新账号的缺省。
+ */
+const SUGGESTED_USES = ["\\Sent", "\\Junk", "\\Archive", "\\All"];
 
 /** 名称回退名单（服务端不给 special-use、imapflow 也没按名字认出时用） */
 const NAME_FALLBACK: { use: string; names: string[] }[] = [
@@ -122,7 +138,9 @@ export async function listAccountFolders(
 }
 
 /**
- * 推荐同步的文件夹：INBOX + 特殊用途文件夹（已发送 / 草稿 / 已删除 / 垃圾邮件 / 归档）。
+ * 推荐同步的文件夹：INBOX + 已发送 / 垃圾邮件 / 归档（`SUGGESTED_USES`，⚠ 不含草稿与已删除，
+ * 理由见该常量的注记）。
+ *
  * 新增账号时用它预填注册表的 `folders`——「发件」页依赖服务器「已发送」在白名单里，
  * 不预填的话新账号的「发件」页会一直是空的（用户得自己猜名字）。
  */
@@ -131,7 +149,7 @@ export function suggestSyncFolders(folders: FolderInfo[]): string[] {
   const out: string[] = [];
   const inbox = selectable.find((f) => f.path.toUpperCase() === "INBOX");
   out.push(inbox?.path ?? "INBOX");
-  for (const use of SPECIAL_USE_ORDER) {
+  for (const use of SUGGESTED_USES) {
     const hit = selectable.find((f) => f.specialUse === use);
     if (hit && !out.includes(hit.path)) out.push(hit.path);
   }

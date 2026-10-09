@@ -336,9 +336,27 @@ async function ingestAdaptive(
     const slice = metas.slice(done, done + size);
     const t0 = Date.now();
     const before = ingested.length;
+    /**
+     * 草稿不是邮件（2026-10-10）：带 `\Draft` 标记的副本**不入索引**。
+     *
+     * 判据用标记而不是文件夹名（各服务商的草稿文件夹叫法不同：草稿 / Drafts / [Gmail]/Drafts）；
+     * 我们 APPEND 草稿时也带这个标记。这样即使有人把草稿文件夹勾进同步白名单，
+     * 草稿也不会变成"邮件"混进列表（展示层还有一道 `NOT_DRAFT_SQL` 兜底）。
+     *
+     * ⚠ **必须占位计数**：调用方用水位线推在 `ingested` 的最后一条上（`fresh[done.length-1]`），
+     *   直接把草稿从数组里剔掉会让水位线停在它前面 → 下一轮又捞出来，永远卡在同一封。
+     *   所以这里给每封草稿补一个空 messageId 的占位项（`created: false`），
+     *   调用方据此把"没抓正文"从统计里排掉（见 syncFolder 的 fetched 过滤）。
+     */
+    const draftSlice = slice.filter((m) => (m.flags ?? []).includes("\\Draft"));
+    for (let i = 0; i < draftSlice.length; i++) {
+      ingested.push({ messageId: "", created: false });
+      pending.delete(draftSlice[i].uid);
+    }
+    const work = slice.filter((m) => !(m.flags ?? []).includes("\\Draft"));
     // 分流：小邮件整封下载（一次 FETCH 一批）；大邮件走「只取正文 + 内嵌图」
-    const partialSlice = slice.filter((m) => m.size > MAX_SOURCE_BYTES);
-    const wholeSlice = slice.filter((m) => m.size <= MAX_SOURCE_BYTES);
+    const partialSlice = work.filter((m) => m.size > MAX_SOURCE_BYTES);
+    const wholeSlice = work.filter((m) => m.size <= MAX_SOURCE_BYTES);
     for (const group of batchBySize(wholeSlice, SOURCE_BATCH_BYTES, BACKFILL_CHUNK)) {
       await fetchSources(client, group.uids, async (uid, source) => {
         const meta = pending.get(uid);
@@ -359,7 +377,7 @@ async function ingestAdaptive(
     // ⚠ 这些邮件没有原文可解析，而元数据那一遍 FETCH **刻意不带 ENVELOPE**（见
     //   imap.ts 的 META_QUERY：真机实测一封 15ms，占满整个元数据遍）——所以这里给
     //   它们单独补一次信封。通常一块里 0~2 封，一条命令就够。
-    const missing = slice.filter((m) => pending.has(m.uid));
+    const missing = work.filter((m) => pending.has(m.uid));
     if (missing.length > 0) {
       const envelopes = await fetchEnvelopes(
         client,
@@ -565,7 +583,8 @@ export async function syncFolder(
     if (fresh.length > 0) {
       const deadline = Date.now() + BACKFILL_BUDGET_MS;
       const done = await ingestAdaptive(db, dataDir, client, account.id, folder, fresh, deadline);
-      fetched.push(...done);
+      // 空 messageId = 被跳过的草稿占位（见 ingestAdaptive）：水位线要用它，统计不要
+      fetched.push(...done.filter((d) => d.messageId !== ""));
       const top = fresh[done.length - 1]?.uid ?? lastSeenUid;
       if (top > lastSeenUid) lastSeenUid = top;
       saveFolder(

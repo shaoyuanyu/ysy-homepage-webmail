@@ -27,6 +27,16 @@ export interface Draft {
   references: string[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * 正文/附件是否已从服务器读取（2026-10-10 阶段 1）。
+   *
+   * 服务商草稿文件夹成为唯一事实源后，列表只用 IMAP `envelope` 就能拼出来（主题 / 收件人 /
+   * 时间，便宜），**正文与附件要抓原文**——所以列表里的服务器草稿可能"还没读过内容"：
+   * `contentLoaded: false` 时 `body` 是空串（**不是**"这封草稿没有正文"），界面必须区分这两件事。
+   */
+  contentLoaded: boolean;
+  /** 附件清单（读过的服务器草稿才有；站内暂存的草稿为 []）。只读展示 + 保存时原样保留 */
+  attachments: { filename: string; contentType: string; size: number }[];
 }
 
 export interface DraftInput {
@@ -58,6 +68,10 @@ interface DraftRow {
   references_json: string;
   created_at: string;
   updated_at: string;
+  server_uid: number | null;
+  server_dirty: number;
+  server_parsed: number;
+  attachments_json: string;
 }
 
 const KINDS = new Set(["new", "reply", "forward"]);
@@ -78,6 +92,11 @@ function toDraft(row: DraftRow): Draft {
     references: JSON.parse(row.references_json) as string[],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // 本地暂存的草稿（还没投递、或投递后又改过）内容就在本地表里 → 一律算"已读取"；
+    // 只有"服务器上有、本地只见过 envelope"的那种才需要按需抓原文
+    contentLoaded:
+      row.server_dirty === 1 || row.server_uid === null || row.server_parsed === 1,
+    attachments: JSON.parse(row.attachments_json || "[]") as Draft["attachments"],
   };
 }
 
@@ -94,6 +113,30 @@ export function listDrafts(db: Db): Draft[] {
     .prepare("SELECT * FROM drafts ORDER BY updated_at DESC, rowid DESC")
     .all() as DraftRow[];
   return rows.map(toDraft);
+}
+
+/**
+ * 从**本地缓存**里找草稿（写信页的"找回同一原信的最新草稿"用）。
+ *
+ * ⚠ 故意只读本地、不发 IMAP：写信页是高频入口（写邮件/回复/转发每次都会问一次），
+ *   每个账号一次登录的代价不能压在这里。新鲜度由**草稿箱**负责——打开草稿箱会带
+ *   `?refresh=1` 去服务商那边对一遍（手机写了一半的回复由此进入缓存）。
+ */
+export function findDrafts(db: Db, opts: { kind?: string; kindRef?: string }): Draft[] {
+  let sql = "SELECT * FROM drafts";
+  const params: string[] = [];
+  const where: string[] = [];
+  if (opts.kind) {
+    where.push("kind = ?");
+    params.push(opts.kind);
+  }
+  if (opts.kindRef !== undefined) {
+    where.push("kind_ref = ?");
+    params.push(opts.kindRef);
+  }
+  if (where.length > 0) sql += ` WHERE ${where.join(" AND ")}`;
+  sql += " ORDER BY updated_at DESC, rowid DESC";
+  return (db.prepare(sql).all(...params) as DraftRow[]).map(toDraft);
 }
 
 export function getDraft(db: Db, id: string): Draft | null {
@@ -120,6 +163,8 @@ export function createDraft(db: Db, input: DraftInput): Draft {
       : [],
     createdAt: now,
     updatedAt: now,
+    contentLoaded: true,
+    attachments: [],
   };
   db.prepare(
     `INSERT INTO drafts (id, kind, kind_ref, account_id, to_text, cc_text, bcc_text,
