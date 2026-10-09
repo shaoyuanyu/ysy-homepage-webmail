@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { loadAccounts, loadCaldav, loadCredentials, loadModel, mailDataDir } from "./config.js";
 import { openDb } from "./db.js";
-import { syncAccount } from "./fetcher.js";
+import { hasPendingBackfill, syncAccount } from "./fetcher.js";
 import { markSyncOk } from "./health.js";
 import { watchAccount } from "./idle.js";
 import { agentDbPath, openAgentDb, type AgentDb } from "./ledger.js";
@@ -96,8 +96,30 @@ for (const account of accounts) {
   markSyncOk(account.id);
   for (const r of results) {
     console.log(
-      `[${r.accountId}] ${r.folder}: +${r.fetched} 封, 标记更新 ${r.flagsUpdated}${r.rebuilt ? ", 已重建" : ""}`
+      `[${r.accountId}] ${r.folder}: +${r.fetched} 封, 标记更新 ${r.flagsUpdated}${r.rebuilt ? ", 已重建" : ""}` +
+        (r.backfillRemaining > 0 ? `，历史回填剩余 ${r.backfillRemaining} 封` : "")
     );
+  }
+  // `--once` = 把这次同步做完：首轮是倒序分块回填（一次一块，见 fetcher.ts），
+  // 只跑一轮会停在「最新那几十封」。这里持续泵到铺满为止——单块很小，
+  // 每块打一行进度，Ctrl-C 也能安全中断（游标已落库，下次接着来）。
+  // ⚠ 回填块不算「新邮件」，不进触发接线（onIngested 只吃增量）。
+  // 常驻模式下由 IDLE 循环的回填节拍负责，这里不额外泵。
+  if (once) {
+    let pumped = 0;
+    while (hasPendingBackfill(db, account.id)) {
+      const more = await syncAccount(db, dataDir, account, cred, undefined, { mode: "backfill" });
+      const n = more.reduce((sum, r) => sum + r.backfilled, 0);
+      const left = more.reduce((sum, r) => sum + r.backfillRemaining, 0);
+      pumped += n;
+      if (n === 0 && left > 0) {
+        console.error(`[${account.id}] 历史回填卡住（本轮 0 封、剩余 ${left} 封），停止泵送`);
+        break;
+      }
+      if (n > 0) {
+        console.log(`[${account.id}] 历史回填 +${n} 封（累计 ${pumped}），剩余 ${left} 封`);
+      }
+    }
   }
   await onIngested(results);
 }

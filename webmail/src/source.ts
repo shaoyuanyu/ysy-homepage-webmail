@@ -2,7 +2,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { simpleParser } from "mailparser";
-import { connectAccount, fetchSource, openReadOnly } from "../../mail/src/imap.js";
+import { connectAccount, fetchPartBody, fetchSource, openReadOnly } from "../../mail/src/imap.js";
+import { decodePartPayload, type AttachmentEntry } from "../../mail/src/mime.js";
 import { extractRefKeys, snippetOf } from "../../mail/src/message.js";
 import { withAccountLock } from "./locks.js";
 import type { WebmailContext } from "./api.js";
@@ -99,7 +100,7 @@ async function storeSource(ctx: WebmailContext, messageId: string, raw: Buffer):
     ctx.db
       .prepare(
         `UPDATE messages SET truncated = 0, eml_path = ?, size = ?, snippet = ?,
-           refs_json = ?, has_attach = ? WHERE message_id = ?`
+           refs_json = ?, has_attach = ?, attachments_json = NULL WHERE message_id = ?`
       )
       .run(
         emlRel,
@@ -125,12 +126,56 @@ async function storeSource(ctx: WebmailContext, messageId: string, raw: Buffer):
   })();
 }
 
+/**
+ * **按需取一个被推迟的附件**（2026-10-08，附件门控）：向服务器只取那一个部件
+ * （`BODY.PEEK[n]`，红线 1），**不下载整封**、也不改本地存档。
+ *
+ * 返回 null = 取不到（没有部件号 / 账号凭据缺失 / 服务器拒绝）——调用方会退回
+ * 「整封补取一次」这条老路，保证用户点了附件一定有东西。
+ */
+export async function fetchDeferredAttachment(
+  ctx: WebmailContext,
+  messageId: string,
+  entry: AttachmentEntry
+): Promise<Buffer | null> {
+  if (!entry.part) return null;
+  if (entry.size > MAX_ONDEMAND_BYTES) return null;
+  const copies = ctx.db
+    .prepare("SELECT account_id, folder, uid FROM copies WHERE message_id = ?")
+    .all(messageId) as { account_id: string; folder: string; uid: number }[];
+  for (const copy of copies) {
+    const account = ctx.accounts.get(copy.account_id);
+    const cred = ctx.credentials.get(copy.account_id);
+    if (!account || !cred) continue;
+    try {
+      return await withAccountLock(account.id, async () => {
+        const client = await connectAccount(account, cred);
+        try {
+          await openReadOnly(client, copy.folder); // 只读 EXAMINE，不动任何标记
+          const rawPart = await fetchPartBody(client, copy.uid, entry.part!);
+          // ⚠ BODY.PEEK[n] 给的是**未解码**的部件，本地解析给的是解码后的——必须解开，
+          //   否则「点附件」下回来的是 base64 文本（2026-10-08 实测）
+          return rawPart ? decodePartPayload(rawPart, entry.encoding) : null;
+        } finally {
+          await client.logout().catch(() => {});
+        }
+      });
+    } catch {
+      // 换下一个副本试
+    }
+  }
+  return null;
+}
+
 /** 读取已落盘的原文（GET /message/:id/source 用）；没有原文时返回 null */
 export function readSource(ctx: WebmailContext, messageId: string): Buffer | null {
   const row = ctx.db
-    .prepare("SELECT eml_path FROM messages WHERE message_id = ?")
-    .get(messageId) as { eml_path: string } | undefined;
+    .prepare("SELECT eml_path, truncated FROM messages WHERE message_id = ?")
+    .get(messageId) as { eml_path: string; truncated: number } | undefined;
   if (!row || !row.eml_path) return null;
+  // ⚠ 精简原文（附件门控）**不能**当「.eml 原件」下发：那是重建过的、缺附件的副本，
+  //   把它当原件给用户是骗人的（2026-10-08）。要原件请走 POST /source 补取。
+  if (row.truncated === 1) return null;
   try {
     return readFileSync(join(ctx.dataDir, row.eml_path));
   } catch {

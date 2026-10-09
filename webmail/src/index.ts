@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { openDb } from "../../mail/src/db.js";
+import { hasPendingBackfill } from "../../mail/src/fetcher.js";
 import { backfillRefs } from "../../mail/src/message.js";
-import { createApiServer, runSync, type WebmailContext } from "./api.js";
+import { createApiServer, isFullSyncInFlight, runSync, type WebmailContext } from "./api.js";
 import { loadAccounts, loadCredentials, webmailDataDir } from "./config.js";
 import { MIRROR_SWEEP_MS, mirrorDrafts } from "./draft-mirror.js";
 
@@ -9,6 +10,13 @@ const PORT = Number(process.env.WEBMAIL_PORT ?? 9710);
 /** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 WEBMAIL_HOST 覆盖（如 0.0.0.0） */
 const HOST = process.env.WEBMAIL_HOST ?? "127.0.0.1";
 const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 60_000);
+/**
+ * 回填泵节拍（2026-10-08）：还有历史回填没做完时，用这个节拍驱动「一次一块」的
+ * 回填轮（fetcher.ts 的 `mode: "backfill"`）。60s 的常规轮只吃一块，靠它才能把
+ * 首轮铺满整个邮箱的时间压到十几分钟；而每块的账号锁持有只有几秒，
+ * 期间 LIST / 发信 / 标记都能插进来。
+ */
+const BACKFILL_TICK_MS = Number(process.env.WEBMAIL_BACKFILL_TICK_MS ?? 1500);
 
 async function main() {
   const dataDir = webmailDataDir();
@@ -40,6 +48,18 @@ async function main() {
     runSync(ctx).catch((err) => console.error("[webmaild] 定时同步失败：", err));
   }, SYNC_INTERVAL_MS);
 
+  // 历史回填泵（见文件头 BACKFILL_TICK_MS）：没有待回填的文件夹时几乎是空转
+  // （一次 hasPendingBackfill 查询）；有活干时每拍吃一块，直到铺满。
+  // ⚠ 让路规则：全量轮在飞时跳过这一拍——否则回填轮会把 60s 常规轮（增量 + 标记
+  //   回读）一并顶掉（api.ts 的 runSync 语义 3）。
+  const backfillTimer = setInterval(() => {
+    if (isFullSyncInFlight()) return;
+    if (!hasPendingBackfill(db)) return;
+    runSync(ctx, undefined, { mode: "backfill" }).catch((err) =>
+      console.error("[webmaild] 历史回填失败：", err)
+    );
+  }, BACKFILL_TICK_MS);
+
   // 草稿 → 服务器「草稿」文件夹镜像（2026-10-06，见 draft-mirror.ts）：
   // 每 4 秒扫一次，只投递「安静满 10 秒」的 dirty 草稿（合并连续自动保存）
   const draftTimer = setInterval(() => {
@@ -53,6 +73,7 @@ async function main() {
 
   const shutdown = () => {
     clearInterval(timer);
+    clearInterval(backfillTimer);
     clearInterval(draftTimer);
     server.close();
     process.exit(0);

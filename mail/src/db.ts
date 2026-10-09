@@ -42,6 +42,10 @@ function migrate(db: Db): void {
       uidvalidity INTEGER,
       last_seen_uid INTEGER NOT NULL DEFAULT 0,
       last_flags_sync TEXT,
+      -- 历史回填游标（NULL = 已完成；见 migrate() 末尾的说明）
+      backfill_uid INTEGER,
+      backfill_total INTEGER NOT NULL DEFAULT 0,
+      backfill_remaining INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (account_id, path)
     );
 
@@ -152,8 +156,32 @@ function migrate(db: Db): void {
   addColumnIfMissing(db, "messages", "refs_json", "refs_json TEXT");
   addColumnIfMissing(db, "messages", "has_attach", "has_attach INTEGER NOT NULL DEFAULT 0");
 
+  // 精简原文的附件清单（2026-10-08，见 mail/src/mime.ts）：
+  // 超过门控（缺省 500KB）的邮件同步时**不下载附件**，只留正文 + 内嵌图，附件按
+  // 「序号/文件名/类型/大小/部件号」记在这里——界面照样列出来，点击时按部件号向
+  // 服务器取。NULL = 没有这回事（原文完整，或压根没原文）。
+  // ⚠ `truncated` 因此有两种含义（调用方用 `eml_path` 区分）：
+  //   truncated=1 且 eml_path=''     → 只有索引（正文都没有）
+  //   truncated=1 且 eml_path!=''    → **精简原文**（正文可读，附件未下载）
+  addColumnIfMissing(db, "messages", "attachments_json", "attachments_json TEXT");
+
   // 联系人归属账号（4.14）：'' = 本地联系人（不归属任何账号）。存量行默认为本地。
   addColumnIfMissing(db, "contacts", "account", "account TEXT NOT NULL DEFAULT ''");
+
+  // 首次同步的历史回填游标（2026-10-08，设计见 fetcher.ts 文件头）：
+  // 旧实现把 last_seen_uid 只在「整个文件夹抓完」时落库——中途重启/部署等于从 UID 1
+  // 全部重来。现在首轮改为**从最新 UID 倒序分块**抓、逐块落库：
+  //   backfill_uid       下一个要处理的最大 UID（NULL = 该文件夹历史回填已完成）
+  //   backfill_total     开始回填时服务端该文件夹的邮件总数（进度分母）
+  //   backfill_remaining 尚未处理的历史邮件数（进度分子 = total - remaining）
+  addColumnIfMissing(db, "folders", "backfill_uid", "backfill_uid INTEGER");
+  addColumnIfMissing(db, "folders", "backfill_total", "backfill_total INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(
+    db,
+    "folders",
+    "backfill_remaining",
+    "backfill_remaining INTEGER NOT NULL DEFAULT 0"
+  );
 }
 
 /**

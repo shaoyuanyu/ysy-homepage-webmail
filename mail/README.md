@@ -10,10 +10,11 @@ MAIL-AGENT.md 第八节第 1、3、4、5 步的实现。独立包、独立进程
 |---|---|
 | `src/config.ts` | 账号注册表与凭据加载（`accounts.json` / `credentials.json` / CalDAV 段） |
 | `src/db.ts` | SQLite schema：`folders`（增量状态机）/ `messages` / `copies` / `messages_fts`（trigram）；`resolveMessageKey`（工具面 messageId 宽容归一） |
-| `src/imap.ts` | IMAP 读取原语：EXAMINE 打开、增量 meta、PEEK 取原文、FLAGS 回读 |
-| `src/message.ts` | MIME 解析与入库：`messages` 按 Message-ID 单份（库键 `mid:<裸id小写>`），副本落 `copies`，幂等 |
-| `src/fetcher.ts` | 增量同步：UIDVALIDITY 变化重建、大小阈值、标记回读窗口 90 天 |
-| `src/idle.ts` | IDLE 监听：exists 事件唤醒、3 分钟兜底轮询、指数退避重连、AbortSignal 停机 |
+| `src/imap.ts` | IMAP 读取原语：EXAMINE 打开（**已开着同一文件夹则跳过**）、增量 meta（**不含 ENVELOPE**，见 MAIL-AGENT.md 4.17.2）、`fetchEnvelopes`（只给没有原文的超大邮件用）、PEEK 取原文、FLAGS 回读 |
+| `src/mime.ts` | **精简原文**（2026-10-08 附件门控）：按原结构**剪枝**（`pruneTree`：容器类型/层次保真，拍平会让 text+html 被拼成一段纯文本）、拼一份合法 MIME（`buildTrimmedSource`）、算附件清单（`planParts`）、按传输编码解码按需取回的部件（`decodePartPayload`）。纯函数，单测 13 条 |
+| `src/message.ts` | MIME 解析与入库：`messages` 按 Message-ID 单份（库键 `mid:<裸id小写>`），副本落 `copies`，幂等；`pruneOrphanMessages()` = **集合化**清理已无副本的邮件与 FTS 行（逐封删 FTS 是 O(n²)，见 webmail README 的事故记录）；`removeEmlFiles()` 在事务提交后回收原文文件 |
+| `src/fetcher.ts` | 增量同步 + **首轮倒序分块回填**（2026-10-08）：新账号从最新 UID 往下逐块抓（最新优先）、逐块落游标（重启续抓）、一次 FETCH 取一批原文；UIDVALIDITY 变化重建、大小阈值、标记回读窗口 90 天 |
+| `src/idle.ts` | IDLE 监听：exists 事件唤醒、3 分钟兜底轮询（**有待回填时改用 1.5 秒回填节拍**，且回填轮不重跑标记回读）、指数退避重连、AbortSignal 停机 |
 | `src/search.ts` | 搜索封装：≥3 字符走 trigram `MATCH`，1~2 字符走 `LIKE` 兜底 |
 | `src/ledger.ts` | `agent.db`：`tool_ledger`（只追加台账，工具层写、不可绕过）+ `pending_sends`（发信闸门队列，含 MIME 字节） |
 | `src/flags.ts` | **全包唯一 STORE**（3.5）：只碰 `\Seen`/`\Flagged`、`+FLAGS`/`-FLAGS`、`uid: true`、索引外消息拒绝、多副本一起写、前值/后值落台账；账号级互斥锁（`withAccountLock`） |
@@ -23,7 +24,7 @@ MAIL-AGENT.md 第八节第 1、3、4、5 步的实现。独立包、独立进程
 | `src/tools.ts` | 8 个固定工具的定义与 `callTool` 分发（每次调用先落台账，成功/失败都记） |
 | `src/mcp.ts` | 工具面 HTTP 服务：`POST /mcp`（MCP streamable HTTP，无状态）+ `GET /health` `/ledger` `/pending-sends` + `POST /pending-sends/:id/confirm|discard` + `/agent/*` 只读视图（第 5 步），绑 `127.0.0.1:9711`（`MAIL_AGENT_HOST` / `MAIL_AGENT_TOOLS_PORT` 可调） |
 | `src/agentview.ts` | `/agent/*` 只读视图的查询逻辑（第 5 步）：timeline / message 详情 / .eml / rfc822 展开 / judgments / reasoning——只查 mail.db + agent.db，无写路径 |
-| `src/index.ts` | 入口：`--once` 单轮同步；无参数进入 IDLE 常驻并挂起工具面 |
+| `src/index.ts` | 入口：`--once` 单轮同步（**并把首轮回填一直泵到铺满**）；无参数进入 IDLE 常驻并挂起工具面 |
 
 ## 数据目录
 
@@ -84,12 +85,15 @@ pnpm test                         # 测试（集成用例需要容器：CONTAINE
 pnpm typecheck
 ```
 
-## 测试（104 条，test/）
+## 测试（132 条，test/）
 
 集成用例对真实 Dovecot 容器断言，本机用 rootless podman（`CONTAINER_BIN=podman`），CI 用 docker：
 
 - **PEEK 常驻断言（7.1）**：抓取前后服务端 `\Seen` 集合逐封一致——这一步不过，后面都不许走。
 - 幂等（重复同步 +0）、增量（新邮件到达入库）、标记回读（服务端置 `\Seen` 同步回本地）。
+- **附件门控（`test/partial-fetch.test.ts`，6 条 + `test/mime.test.ts`，13 条，2026-10-08）**：真 Dovecot 上验证——附件字节**确实没下载**（存下来的 `.eml` 里搜不到附件载荷）、正文与 cid 内嵌图照常可读、**清单序号与整封解析一致**（补取整封后不会点错文件）、只有大正文的邮件正文完整、agent 侧 `read_message`/`get_attachment` 能按需取回并**按 base64 解码**。`mime.test.ts` 是纯函数单测（保留/丢弃规则、头部过滤、拼出来的字节能被 mailparser 解析回原样、非 ASCII 文件名、**嵌套结构保真**）。真机 QQ 上还做过一次完整对照：8 封 >500KB 的邮件里清单序号 **8/8** 与整封解析一致，字节 30.4MB → 0.9MB（省 97%）。
+- **超大邮件（`test/oversized.test.ts`，1 条，2026-10-08）**：把 `MAIL_AGENT_MAX_SOURCE_BYTES` 压到 1 字节，让**所有**邮件走「只存元数据」那条路（红线 12）——库里没有原文、`truncated=1`，但**主题 / 发件人 / 日期必须完整**。它锁的是性能改动引入的新路径：例行元数据遍不再取 `envelope`（真机实测 15ms/封，占满整遍），没有原文的邮件由 `fetchEnvelopes()` 单独补信封。反向验证过：去掉补信封那一步，这条用例立刻报「主题为空」。
+- **首轮回填（`test/backfill.test.ts`，7 条，2026-10-08）**：`MAIL_AGENT_BACKFILL_CHUNK=1` 把块压到最小，逐块断言——第一块吃的是**最新**那封、游标逐块递减、**关库重开（模拟重启）后从游标续抓**、铺满后进度归零且再同步 0 封、回填完成后新邮件走增量（进 `ingested`）、回填途中新到的邮件当轮即入库（不等历史抓完）。最后一条是**残留同步状态的自愈**：水位线还在（`last_seen_uid = 6711`）而本地一封副本都没有（删过账号）时，必须当作从未同步过重来——否则服务端几千封全被当成「早就抓过了」，一封信都不下来（红线 22、MAIL-AGENT.md 4.17.1）。
 - UIDVALIDITY 变化后重建该文件夹索引，孤儿 message 一并清理。
 - IDLE 唤醒（新邮件 631ms 入库，不等兜底轮询）与优雅停机。
 - trigram 模糊搜索 6 条（`test/search.test.ts`）。

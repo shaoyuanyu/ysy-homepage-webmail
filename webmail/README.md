@@ -20,7 +20,7 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 | `src/backup.ts` | 邮件数据快照（4.15）：SQLite 在线备份 + `eml/` 硬链 + 凭据 600 + 保留 N 份；`tsx src/backup.ts` 可直接跑 |
 | `src/drafts.ts` / `src/draft-mirror.ts` | 服务端草稿（4.9）+ 镜像到账号服务商「草稿」文件夹（单向） |
 | `src/locks.ts` | 账号级 IMAP 互斥锁（红线 10）；同步 / 标记 / 移动 / 发信 / 草稿镜像共用 |
-| `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + 草稿镜像扫描（4s）+ API 常驻 |
+| `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + **1.5 秒回填泵**（有待回填的历史时才真干活，见 `mail/src/fetcher.ts` 的倒序分块回填）+ 草稿镜像扫描（4s）+ API 常驻 |
 
 ## 数据目录
 
@@ -57,6 +57,10 @@ pnpm typecheck
 - **账号管理**：校验分支（缺字段 / 邮箱非法 / 端口越界 / id 冲突 409 / folders 全空）、连接失败（密码错 / 不可达端口）**不落盘且进程不挂**、HTTP 400/502/201/DELETE、落盘后 `credentials.json` 为 600 且顶层字段不被覆盖、删除清理副本与孤儿消息、至少保留一个账号 409。
 - **文件夹（2026-10-07）**：`GET /folders`（清单 + `suggested` + 当前白名单、未知账号 404）、`POST /folders` 预览（不落盘、密码错 502）、新增账号不传 `folders` 时按服务端清单自动预填。
 - **批量标记（多选，2026-10-07）**：`POST /flags {messageIds:[…]}` —— 一批消息的**全部副本**一起写（红线 8）、每账号一条连接、每文件夹一次 STORE；单账号失败进 `skipped` 不阻断；>500 条 400；混入不存在的 id 不报错（`updated/messages` 为 0）。
+- **孤儿清理（2026-10-08，`test/orphan-prune.test.ts`）**：源码扫描锁住「不许按 `message_id` 逐条删 FTS」（只允许 `source.ts` 的单封替换）；并在 5000 封规模的合成库上跑真实 `deleteAccount`——断言无孤儿、`messages` 与 `messages_fts` 行数一致、共有邮件保留，且耗时 < 10s（**旧实现 41.3 秒 → 670ms**；根因是 FTS 的 `message_id` 是 UNINDEXED 列，逐封删 = 每封一次全表扫）。另有一条：删账号要把原文 `.eml` 一起回收（只动本事务清理出的文件，孤立老文件不碰）——旧实现留下 **6707 个文件 / 438MB** 永不引用的原文。
+- **附件门控（2026-10-08，`test/partial-attachment.test.ts`）**：精简原文（正文可读、附件未下载）的完整服务端链路——详情以**清单**给附件（`deferred: true`）与 `partial: true`；内嵌图从本地按 cid 取；被推迟的附件点击时 `BODY.PEEK[part]` **只取那一个部件**并**按传输编码解码**（不下载整封）；**精简原文不算 `.eml` 原件，`GET /source` 一律 404**，`POST /source` 补取后才可下载（补取同时清空清单）。
+- **账号同步状态的归属（2026-10-08，`test/account-state.test.ts`）**：`deleteAccount` 必须把该账号的 `folders` 行（水位线 + 回填游标）与副本一起清掉、并回收孤儿 messages/FTS/原文；`addAccount` 在连接测试通过后、落盘前再清一次同 id 的残留（给已被污染的库兜底）。⚠ 账号 id 由邮箱地址推导，`folders` 行不清 = 「删掉再重加同一个邮箱」继承旧水位线 → 一封信都下不来且无报错（红线 22）。
+- **首轮回填进度（2026-10-08，`test/backfill-progress.test.ts`）**：`GET /health` 每账号带 `backfill`（`remaining/total/done/folder/folders`）——回填未完成时报告剩余量与总量、**不推进 `lastNewMail`**（回填的旧邮件不是新邮件），回填泵跑到铺满后回到 `null`，之后到达的新邮件才把 `lastNewMail` 推到当前时刻。
 - **原文与取证（2026-10-07）**：把已同步邮件改造成 truncated（删原文 + 清 `eml_path`）后，`GET /source` 404 → `POST /source` 取回并回填（正文/附件/truncated 复位）→ 再 POST 幂等 → `GET /source` 拿到 .eml 字节；详情返回按原文顺序的 `headers`。
 
 ## 备份

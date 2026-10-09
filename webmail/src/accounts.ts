@@ -5,6 +5,7 @@ import nodemailer from "nodemailer";
 import type { AccountCredential, CredentialsFile } from "../../mail/src/types.js";
 import type { WebmailContext } from "./api.js";
 import { listAccountFolders, listFoldersWith, suggestSyncFolders, type FolderInfo } from "./folders.js";
+import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
 import type { WebmailAccount, WebmailAccountsFile } from "./types.js";
 
 /** 业务错误：status 400 参数非法 / 409 冲突 / 502 连接测试失败，由 API 层映射为 HTTP 状态码 */
@@ -56,6 +57,43 @@ export interface UpdateAccountInput {
 const EMAIL_RE = /^[^\s@,;<>]+@[^\s@,;<>]+$/;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
+/**
+ * 账号色板（MAIL-AGENT.md 4.2）：青 / 紫 / 橙 / 玫红 / 蓝绿——避开等级配色（红蓝绿琥珀）
+ * 与邮件页自己的语义色（未读蓝、方向 emerald/amber、星标前景色）。
+ *
+ * ⚠ 颜色名（不是 hex）由前端 `components/mail/account-dot.ts` 的 `ACCOUNT_DOT` 映射成
+ *   整串静态类名（浅色 600 / 深色 400 两档），两处是同一套名字，**改动必须同步**。
+ */
+export const ACCOUNT_COLOR_PALETTE = ["cyan", "violet", "orange", "pink", "teal"] as const;
+
+/**
+ * 历史遗留色 → 色板名：老版本的缺省色是写死的 `#0ea5e9`（天蓝），避让时必须把它当成
+ * `cyan` 占位，否则新账号的缺省色又会落回同一种蓝（正是用户报的那个问题）。
+ * 值与前端 `components/mail/account-dot.ts` 的 `LEGACY_COLOR_ALIAS` 同步。
+ */
+const LEGACY_COLOR_ALIAS: Record<string, string> = { "#0ea5e9": "cyan" };
+
+/** 颜色的比较键：色板名原样、历史缺省色归到对应色板名、其余原样小写（只用于避让比较） */
+export function accountColorKey(color: string): string {
+  const c = color.trim().toLowerCase();
+  return LEGACY_COLOR_ALIAS[c] ?? c;
+}
+
+/**
+ * 下一个可用的账号色：先取色板里**没人用过**的，全占满才按已用数量轮转。
+ *
+ * ⚠ 新增账号的缺省色**不能是常量**（2026-10-09 用户报「账号指示器里多个账号颜色没有区别」
+ *   的根因）：以前缺省写死 `#0ea5e9`，于是从界面加进来的账号全是同一个天蓝色，色点等于
+ *   没有信息。缺省值必须随已有账号变化，新账号才不会一进来就撞色。
+ */
+export function nextAccountColor(used: Iterable<string>): string {
+  const taken = new Set([...used].map(accountColorKey));
+  return (
+    ACCOUNT_COLOR_PALETTE.find((c) => !taken.has(c)) ??
+    ACCOUNT_COLOR_PALETTE[taken.size % ACCOUNT_COLOR_PALETTE.length]
+  );
+}
+
 /** 从邮箱地址推导账号 id（本地部分小写化、非法字符转 -；冲突时追加 -2/-3…） */
 function deriveId(email: string, taken: Set<string>): string {
   const local = email.split("@")[0] ?? "account";
@@ -69,10 +107,12 @@ function isPort(v: unknown): v is number {
   return Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 65535;
 }
 
-/** 校验 + 归一化输入；返回可入库的账号与凭据（不做任何网络/落盘动作） */
+/** 校验 + 归一化输入；返回可入库的账号与凭据（不做任何网络/落盘动作）
+ *  `usedColors` = 现有账号已占用的颜色（缺省色从这里避开，见 nextAccountColor） */
 export function normalizeAccountInput(
   input: AddAccountInput,
-  existingIds: Set<string>
+  existingIds: Set<string>,
+  usedColors: Iterable<string> = []
 ): { account: WebmailAccount; cred: AccountCredential } {
   const displayName = input.displayName?.trim();
   const email = input.email?.trim();
@@ -104,7 +144,7 @@ export function normalizeAccountInput(
     displayName,
     email,
     provider: input.provider?.trim() || "custom",
-    color: input.color?.trim() || "#0ea5e9",
+    color: input.color?.trim() || nextAccountColor(usedColors),
     imapHost,
     imapPort: input.imapPort!,
     imapSecure: input.imapSecure,
@@ -218,7 +258,8 @@ export async function previewFolders(
       displayName: existing?.displayName ?? email,
       email,
       provider: existing?.provider ?? "custom",
-      color: existing?.color ?? "#0ea5e9",
+      // 探测用的临时对象，不落盘：颜色只是占位（真正入库时由 addAccount 分配）
+      color: existing?.color ?? ACCOUNT_COLOR_PALETTE[0],
       imapHost,
       imapPort: input.imapPort,
       imapSecure: input.imapSecure,
@@ -295,6 +336,37 @@ function toSummary(a: WebmailAccount): AccountSummary {
 }
 
 /**
+ * 清掉某个账号 id 的**残留同步状态**（2026-10-08）：folders 行（水位线 + 回填游标）
+ * 与本地副本，连带孤儿消息、FTS 行与磁盘上的原文。
+ *
+ * ⚠ **folders 行必须一起清**：账号 id 由邮箱地址推导（deriveId），删掉再加同一个邮箱 =
+ * 同一个 id，残留的水位线（last_seen_uid）会被新账号**继承** → 服务端几千封邮件全被当成
+ * 「早就抓过了」，既不抓也不回填，界面连进度都没有、也没有任何报错（用户报「加了账号
+ * 毫无动静」）。同一个 id 的同步状态只属于被删的那个账号，留着它没有合法用途。
+ *
+ * ⚠ 删行与孤儿清理必须在一个事务里（2026-10-07）：避免中途失败留下「副本没了、正文与
+ *   索引还在」的半截状态。⚠ 孤儿清理走 pruneOrphanMessages 的**集合化**写法（2026-10-08，
+ *   旧实现逐封 `DELETE ... WHERE message_id = ?`：FTS 的 message_id 是 UNINDEXED 列，
+ *   逐封删 = 每次全表扫 = O(n²)，6516 封实测 41.3 秒，且 better-sqlite3 是同步 API、
+ *   整个 webmaild 被占住）。原文文件留到事务提交后再删（见 removeEmlFiles 的说明）。
+ */
+function purgeAccountState(ctx: WebmailContext, id: string): void {
+  const stale = (
+    ctx.db.prepare("SELECT DISTINCT message_id FROM copies WHERE account_id = ?").all(id) as {
+      message_id: string;
+    }[]
+  ).map((r) => r.message_id);
+  const pruned = ctx.db.transaction(() => {
+    ctx.db.prepare("DELETE FROM folders WHERE account_id = ?").run(id);
+    ctx.db.prepare("DELETE FROM copies WHERE account_id = ?").run(id);
+    return stale.length > 0
+      ? pruneOrphanMessages(ctx.db, { candidates: stale, collectEml: true })
+      : { removed: 0, emlPaths: [] as string[] };
+  })();
+  removeEmlFiles(ctx.dataDir, pruned.emlPaths);
+}
+
+/**
  * 新增账号：校验 → 连接测试（可用 opts.test=false 关闭，供测试）→ 落盘 → 进 ctx。
  * 顺序保证「测试不过的账号不会出现在任何状态里」。
  */
@@ -309,7 +381,8 @@ export async function addAccount(
   const autoFolders = !input.folders || input.folders.length === 0;
   const { account, cred } = normalizeAccountInput(
     autoFolders ? { ...input, folders: ["INBOX"] } : input,
-    new Set(ctx.accounts.keys())
+    new Set(ctx.accounts.keys()),
+    [...ctx.accounts.values()].map((a) => a.color)
   );
   let detected: FolderInfo[] = [];
   if (opts.test !== false) detected = await testAccountConnection(account, cred);
@@ -317,6 +390,9 @@ export async function addAccount(
     const suggested = suggestSyncFolders(detected);
     if (suggested.length > 0) account.folders = suggested;
   }
+  // 连接测试**通过之后**才清残留（测试不过就不该动库里任何东西）：这个 id 上一次被删时
+  // 留下的 folders 行会让新账号继承旧水位线，结果一封信都下不来（见 purgeAccountState）。
+  purgeAccountState(ctx, account.id);
   ctx.accounts.set(account.id, account);
   ctx.credentials.set(account.id, cred);
   try {
@@ -429,31 +505,17 @@ export async function updateAccount(
 }
 
 /**
- * 删除账号：移出注册表与凭据（落盘），并清掉本地已同步的副本/孤儿邮件。
+ * 删除账号：移出注册表与凭据（落盘），并清掉本地已同步的副本 / 同步状态 / 孤儿邮件。
  * 服务器上的邮件不受影响（本站只做只读同步与显式删除）。
+ *
+ * ⚠ 清理逻辑集中在 purgeAccountState（删除与「新增前清残留」共用一份，避免两处漂移）。
  */
 export function deleteAccount(ctx: WebmailContext, id: string): AccountSummary {
   const account = ctx.accounts.get(id);
   if (!account) throw new AccountError(`账号不存在：${id}`, 404);
   if (ctx.accounts.size <= 1) throw new AccountError("至少保留一个账号", 409);
 
-  const messageIds = ctx.db
-    .prepare("SELECT DISTINCT message_id AS mid FROM copies WHERE account_id = ?")
-    .all(id) as { mid: string }[];
-  // 事务包裹（2026-10-07）：copies / messages / FTS 三处删除要么全成、要么全不成，
-  // 避免中途失败留下「副本没了、邮件正文与索引还在」的半截状态
-  ctx.db.transaction(() => {
-    ctx.db.prepare("DELETE FROM copies WHERE account_id = ?").run(id);
-    for (const { mid } of messageIds) {
-      const left = ctx.db
-        .prepare("SELECT COUNT(*) AS n FROM copies WHERE message_id = ?")
-        .get(mid) as { n: number };
-      if (left.n === 0) {
-        ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(mid);
-        ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(mid);
-      }
-    }
-  })();
+  purgeAccountState(ctx, id);
 
   ctx.accounts.delete(id);
   ctx.credentials.delete(id);

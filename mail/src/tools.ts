@@ -86,7 +86,11 @@ export const TOOLS: ToolDef[] = [
       index: z.number().int().min(0).describe("附件序号（来自 read_message 的 attachments[].index）"),
     },
     async run(ctx, args) {
-      return getAttachment(ctx.db, ctx.dataDir, args.messageId as string, args.index as number);
+      return getAttachment(
+        { db: ctx.db, dataDir: ctx.dataDir, accounts: ctx.accounts, creds: ctx.creds },
+        args.messageId as string,
+        args.index as number
+      );
     },
   },
   {

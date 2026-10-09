@@ -118,6 +118,33 @@ export function resetMaildir(handle: DovecotHandle): void {
 }
 
 /** 通过 IMAP APPEND 投放 fixtures 邮件（不带 \\Seen，即未读）；folder 缺省 INBOX */
+/**
+ * 直接投递一批**内存里的**原始邮件（用例现造 fixture 用：附件大小、cid 内嵌图这些
+ * 场景写成固定文件太脆，见 partial-fetch.test.ts）。
+ */
+export async function deliverRaw(
+  handle: DovecotHandle,
+  raws: Buffer[],
+  folder = "INBOX"
+): Promise<void> {
+  const client = new ImapFlow({
+    host: handle.host,
+    port: handle.port,
+    secure: false,
+    auth: { user: "test", pass: "test" },
+    logger: false,
+  });
+  await client.connect();
+  try {
+    for (const raw of raws) {
+      const ok = await client.append(folder, raw);
+      if (!ok) throw new Error("APPEND 失败（内存 fixture）");
+    }
+  } finally {
+    await client.logout().catch(() => {});
+  }
+}
+
 export async function deliverFixtures(
   handle: DovecotHandle,
   names: string[],

@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { simpleParser } from "mailparser";
 import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
-import { syncAccount } from "../../mail/src/fetcher.js";
+import { backfillProgress, hasPendingBackfill, syncAccount, type SyncOptions } from "../../mail/src/fetcher.js";
 import { searchMessages } from "../../mail/src/search.js";
+import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
 import { threadMessageIds } from "../../mail/src/thread.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import type { CopyRef, FlagChange, SendInput, WebmailAccount } from "./types.js";
@@ -22,6 +23,8 @@ import {
 } from "./contacts.js";
 import { AccountError, addAccount, deleteAccount, previewFolders, setRemoteImageDomains, updateAccount, type AddAccountInput, type UpdateAccountInput } from "./accounts.js";
 import { resolveAttachmentHeaders } from "./attachment.js";
+import { fetchDeferredAttachment } from "./source.js";
+import type { AttachmentEntry } from "../../mail/src/mime.js";
 import { fetchTruncatedSource, readSource } from "./source.js";
 import { listAccountFolders, suggestSyncFolders } from "./folders.js";
 import { deleteServerDraftCopy, readDraftServerRef } from "./draft-mirror.js";
@@ -73,6 +76,8 @@ interface MessageRow {
   eml_path: string;
   refs_json: string | null;
   has_attach: number;
+  /** 精简原文的附件清单（NULL = 原文完整；见 mail/src/mime.ts） */
+  attachments_json: string | null;
 }
 
 // 红线 10（同一账号的 IMAP 操作串行）的锁在 locks.ts——新增草稿镜像模块后，
@@ -307,6 +312,21 @@ function listMessages(ctx: WebmailContext, url: URL) {
   return { items: page.map((r) => listItem(ctx, r, names)), next };
 }
 
+/** 附件清单（精简原文才有；NULL = 原文完整，按整封解析） */
+function attachmentManifest(row: { attachments_json?: string | null }): AttachmentEntry[] | null {
+  if (!row.attachments_json) return null;
+  try {
+    return JSON.parse(row.attachments_json) as AttachmentEntry[];
+  } catch {
+    return null;
+  }
+}
+
+/** cid 归一：两边都可能带/不带尖括号（mailparser 去、BODYSTRUCTURE 留） */
+function normCid(cid: string | null | undefined): string {
+  return (cid ?? "").replace(/[<>]/g, "").trim().toLowerCase();
+}
+
 async function messageDetail(ctx: WebmailContext, messageId: string) {
   const row = messageOf(ctx, messageId);
   if (!row) return null;
@@ -319,23 +339,40 @@ async function messageDetail(ctx: WebmailContext, messageId: string) {
     fromContactId: row.from_addr ? (findContactByEmail(ctx.db, row.from_addr)?.id ?? null) : null,
   };
   if (!row.eml_path) {
-    return { ...base, text: "", html: "", attachments: [], remoteBlocked: 0 };
+    // 只有索引（超大邮件、或结构解析失败的兜底）：正文与附件都没有
+    return { ...base, text: "", html: "", attachments: [], remoteBlocked: 0, partial: false };
   }
   const raw = readFileSync(join(ctx.dataDir, row.eml_path));
   // keepCidLinks：cid 引用交给 renderMailHtml 的重写管线（统一到附件端点，不内嵌 base64）
   const parsed = await simpleParser(raw, { keepCidLinks: true });
-  const attachments = parsed.attachments.map((a, index) => ({
-    index,
-    filename: a.filename ?? `attachment-${index}`,
-    contentType: a.contentType,
-    size: a.size,
-    cid: a.cid ?? null,
-    inline: a.contentDisposition === "inline",
-  }));
+  // ⚠ 清单优先（2026-10-08）：精简原文里**没有**那些被推迟的附件，重新解析出来的序号
+  //   与「补取整封后」不一致——附件列表与 cid 映射必须以同步时记下的清单为准。
+  const manifest = attachmentManifest(row);
+  const attachments = manifest
+    ? manifest.map((m) => ({
+        index: m.index,
+        filename: m.filename,
+        contentType: m.contentType,
+        size: m.size,
+        cid: m.cid,
+        inline: m.inline,
+        // 没留存 → 点开时才去服务器取（附件端点负责）
+        deferred: m.deferred,
+      }))
+    : parsed.attachments.map((a, index) => ({
+        index,
+        filename: a.filename ?? `attachment-${index}`,
+        contentType: a.contentType,
+        size: a.size,
+        cid: a.cid ?? null,
+        inline: a.contentDisposition === "inline",
+        deferred: false,
+      }));
   const cidResolver = (cid: string): string | null => {
-    const hit = parsed.attachments.findIndex((a) => a.cid === cid || a.cid === `<${cid}>`);
+    const want = normCid(cid);
+    const hit = attachments.findIndex((a) => normCid(a.cid) === want);
     if (hit < 0) return null;
-    return `${PUBLIC_PREFIX}/message/${encodeURIComponent(messageId)}/attachment/${hit}`;
+    return `${PUBLIC_PREFIX}/message/${encodeURIComponent(messageId)}/attachment/${attachments[hit].index}`;
   };
   const rendered =
     typeof parsed.html === "string"
@@ -347,15 +384,62 @@ async function messageDetail(ctx: WebmailContext, messageId: string) {
     html: rendered.html,
     remoteBlocked: rendered.remoteBlocked,
     attachments,
+    // 精简原文（正文可读、附件没下载）：前端据此把附件标成「点击取回」，
+    // 并且**不再**显示「正文与附件都没下载」那块空态提示
+    partial: !!manifest,
     // 原始邮件头（2026-10-07，取证用）：按邮件里的原始顺序与原始行给，**不要**用
     // parsed.headers 的 Map（顺序与折行都丢）——排查要看的就是头部原样
     headers: parsed.headerLines.map((h) => ({ key: h.key, line: h.line })),
   };
 }
 
-async function attachmentContent(ctx: WebmailContext, messageId: string, index: number) {
+/**
+ * 取附件内容。
+ *
+ * 两条路（2026-10-08）：
+ * - 原文完整（没有清单）→ 读本地 .eml 按序号取（老路径）；
+ * - **精简原文**（有清单）→ 以清单序号为准：
+ *   · 已留存（内嵌图）→ 从本地精简原文里按 **cid** 找（不能按序号，序号是清单的）；
+ *   · 被推迟的 → 向服务器**只取那一个部件**（`BODY.PEEK[n]`，不下载整封）；
+ *   · 取不到（或老数据没有部件号）→ 退回整封补取一次，再按整封解析取。
+ */
+async function attachmentContent(
+  ctx: WebmailContext,
+  messageId: string,
+  index: number
+): Promise<{ filename: string; contentType: string; content: Buffer; inline: boolean } | null> {
   const row = messageOf(ctx, messageId);
   if (!row || !row.eml_path) return null;
+  const manifest = attachmentManifest(row);
+  if (manifest) {
+    const entry = manifest.find((e) => e.index === index);
+    if (!entry) return null;
+    const raw = readFileSync(join(ctx.dataDir, row.eml_path));
+    if (!entry.deferred) {
+      const parsed = await simpleParser(raw);
+      const want = normCid(entry.cid);
+      const att = parsed.attachments.find((a) => normCid(a.cid) === want);
+      if (!att) return null;
+      return {
+        filename: att.filename ?? entry.filename,
+        contentType: att.contentType,
+        content: att.content,
+        inline: true,
+      };
+    }
+    const part = await fetchDeferredAttachment(ctx, messageId, entry);
+    if (part) {
+      return {
+        filename: entry.filename,
+        contentType: entry.contentType,
+        content: part,
+        inline: entry.inline,
+      };
+    }
+    // 退路：整封补取一次（会清掉清单），再走「原文完整」那条路
+    await fetchTruncatedSource(ctx, messageId);
+    return attachmentContent(ctx, messageId, index);
+  }
   const raw = readFileSync(join(ctx.dataDir, row.eml_path));
   const parsed = await simpleParser(raw);
   const att = parsed.attachments[index];
@@ -616,7 +700,10 @@ async function applyCopiesOp(
     // 源位置的副本行删除；目标文件夹由下一轮同步发现。
     // 整段放进一个事务（2026-10-07）：中途抛错时不会留下「copies 已删、messages 还在」
     // 或「messages 已删、FTS 行还在」的半截状态（FTS 是外部内容表，不受外键级联保护）。
-    ctx.db.transaction(() => {
+    // ⚠ 孤儿清理走 pruneOrphanMessages（集合化，2026-10-08）：旧实现逐封 COUNT + 逐封删
+    //   FTS，FTS 的 message_id 是 UNINDEXED 列 → 每封一次全表扫，批量删 500 封时就明显卡。
+    const affectedMessages = new Set<string>();
+    const pruned = ctx.db.transaction(() => {
       for (const c of handled) {
         const row = ctx.db
           .prepare("SELECT message_id FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
@@ -624,17 +711,12 @@ async function applyCopiesOp(
         ctx.db
           .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
           .run(c.accountId, c.folder, c.uid);
-        if (row) {
-          const left = ctx.db
-            .prepare("SELECT COUNT(*) AS n FROM copies WHERE message_id = ?")
-            .get(row.message_id) as { n: number };
-          if (left.n === 0) {
-            ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(row.message_id);
-            ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(row.message_id);
-          }
-        }
+        if (row) affectedMessages.add(row.message_id);
       }
+      return pruneOrphanMessages(ctx.db, { candidates: [...affectedMessages], collectEml: true });
     })();
+    // 原文文件在事务提交后再删（见 removeEmlFiles 的说明）
+    removeEmlFiles(ctx.dataDir, pruned.emlPaths);
   }
   return { affected, skipped };
 }
@@ -647,29 +729,57 @@ export interface SyncRoundResult {
 
 /** 进行中的全量轮（见 runSync 语义 2）；只允许存在一条 */
 let fullSyncInFlight: Promise<SyncRoundResult> | null = null;
+/** 进行中的回填轮（见 runSync 语义 3）：与全量轮分开计数，谁在跑都不叠第二条 */
+let backfillInFlight: Promise<SyncRoundResult> | null = null;
 
 /**
- * 同步一轮（定时器、启动、`POST /sync` 共用）。
+ * 同步一轮（定时器、启动、`POST /sync`、回填泵共用）。
  *
- * ⚠ 两条语义（2026-10-07 修）：
- * 1. **单个账号失败不再中断整轮**。旧实现在 catch 里 rethrow：第一个坏账号会让后面的
- *    账号这一轮完全不抓（它一直坏 = 后面的账号永远排不上），且 /health 上其它账号的
- *    状态静默陈旧。现在按账号隔离，错误逐个记进 `errors` 与该账号的 `lastError`。
+ * ⚠ 三条语义：
+ * 1. **单个账号失败不再中断整轮**（2026-10-07 修）。旧实现在 catch 里 rethrow：第一个坏账号
+ *    会让后面的账号这一轮完全不抓（它一直坏 = 后面的账号永远排不上），且 /health 上其它
+ *    账号的状态静默陈旧。现在按账号隔离，错误逐个记进 `errors` 与该账号的 `lastError`。
  * 2. **同一时刻只跑一轮全量**。60s 定时器与页面刷新的 `/sync` 会叠加，一轮超过 60s 时
  *    旧实现把新请求无界地排在账号锁后面。现在进行中的全量轮被复用（await 同一条
  *    promise）。指定 `accountId` 的同步不受此限（用户显式动作，且失败要抛给调用方）。
+ * 3. **回填轮（`mode: "backfill"`）单独计数**（2026-10-08）：首轮历史回填由「回填泵」
+ *    高频驱动（一次只吃一块，见 fetcher.ts），若与全量轮共用同一个在飞标记，60s 的常规轮
+ *    会被泵的轮次顶掉——增量与标记回读就再也不跑了。故回填轮只在**没有全量轮**时开跑，
+ *    且回填轮之间也不叠加。
  */
-export function runSync(ctx: WebmailContext, onlyAccount?: string): Promise<SyncRoundResult> {
-  if (onlyAccount) return doRunSync(ctx, onlyAccount);
+export function runSync(
+  ctx: WebmailContext,
+  onlyAccount?: string,
+  opts: SyncOptions = {}
+): Promise<SyncRoundResult> {
+  // 指定账号 = 用户显式动作：串行执行、失败抛给调用方（不参与去重语义）
+  if (onlyAccount) return doRunSync(ctx, onlyAccount, opts);
+  if (opts.mode === "backfill") {
+    if (fullSyncInFlight || backfillInFlight) return fullSyncInFlight ?? backfillInFlight!;
+    const tracked: Promise<SyncRoundResult> = doRunSync(ctx, undefined, opts).finally(() => {
+      if (backfillInFlight === tracked) backfillInFlight = null;
+    });
+    backfillInFlight = tracked;
+    return tracked;
+  }
   if (fullSyncInFlight) return fullSyncInFlight;
-  const tracked: Promise<SyncRoundResult> = doRunSync(ctx).finally(() => {
+  const tracked: Promise<SyncRoundResult> = doRunSync(ctx, undefined, opts).finally(() => {
     if (fullSyncInFlight === tracked) fullSyncInFlight = null;
   });
   fullSyncInFlight = tracked;
   return tracked;
 }
 
-async function doRunSync(ctx: WebmailContext, onlyAccount?: string): Promise<SyncRoundResult> {
+/** 是否有全量轮在飞（回填泵据此让路，避免把常规轮挤掉） */
+export function isFullSyncInFlight(): boolean {
+  return fullSyncInFlight !== null;
+}
+
+async function doRunSync(
+  ctx: WebmailContext,
+  onlyAccount?: string,
+  opts: SyncOptions = {}
+): Promise<SyncRoundResult> {
   const out: SyncRoundResult = { results: [], errors: [] };
   for (const account of ctx.accounts.values()) {
     if (!account.enabled) continue;
@@ -686,14 +796,16 @@ async function doRunSync(ctx: WebmailContext, onlyAccount?: string): Promise<Syn
     }
     try {
       const r = await withAccountLock(account.id, () =>
-        syncAccount(ctx.db, ctx.dataDir, account, cred)
+        syncAccount(ctx.db, ctx.dataDir, account, cred, undefined, opts)
       );
       const now = new Date().toISOString();
       state.lastSync = now;
       state.lastError = null;
-      // 本轮确实抓进新邮件才刷新 lastNewMail——「上次收到新邮件」的语义，
-      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）
-      if (r.some((x) => x.fetched > 0)) state.lastNewMail = now;
+      // 本轮确实抓进**新**邮件才刷新 lastNewMail——「上次收到新邮件」的语义，
+      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）。
+      // ⚠ 回填的历史邮件不算新邮件（`fetched - backfilled`）：否则首轮每抓一块
+      //   都会把前端提醒刷成「收到 N 封新邮件」，几百封旧信被当成刚到的。
+      if (r.some((x) => x.fetched - x.backfilled > 0)) state.lastNewMail = now;
       // 进程重启后内存态丢失：用库里最新一封的日期兜底初始化，
       // 否则重启后要干等下一封新邮件才显示得出时间
       if (!state.lastNewMail) {
@@ -728,13 +840,30 @@ export function createApiServer(ctx: WebmailContext): Server {
       const path = url.pathname;
 
       if (req.method === "GET" && path === "/health") {
+        // backfill（2026-10-08）：该账号历史回填的剩余量/总量，前端据此显示
+        // 「正在抓取历史邮件 x/y」并在回填期间自动刷新列表。null = 已回填完（正常态）。
         return json(res, 200, {
           ok: true,
-          accounts: [...ctx.accounts.values()].map((a) => ({
-            id: a.id,
-            enabled: a.enabled,
-            ...(ctx.syncStates.get(a.id) ?? { lastSync: null, lastError: null, lastNewMail: null }),
-          })),
+          accounts: [...ctx.accounts.values()].map((a) => {
+            const folders = backfillProgress(ctx.db, a.id);
+            const remaining = folders.reduce((sum, f) => sum + f.remaining, 0);
+            const total = folders.reduce((sum, f) => sum + f.total, 0);
+            return {
+              id: a.id,
+              enabled: a.enabled,
+              ...(ctx.syncStates.get(a.id) ?? { lastSync: null, lastError: null, lastNewMail: null }),
+              backfill: folders.length
+                ? {
+                    remaining,
+                    total,
+                    done: Math.max(0, total - remaining),
+                    // 当前最靠前的（剩余最多的）那个文件夹名，供文案「正在抓取「收件箱」历史邮件」
+                    folder: folders[0].path,
+                    folders,
+                  }
+                : null,
+            };
+          }),
         });
       }
 
@@ -742,6 +871,11 @@ export function createApiServer(ctx: WebmailContext): Server {
         // 未读数口径（4.2）：只算 INBOX 中无 \Seen 的副本——「已发送」等文件夹不计
         const unreadStmt = ctx.db.prepare(
           `SELECT COUNT(*) AS n FROM copies c WHERE c.account_id = ? AND c.folder = 'INBOX' AND NOT ${HAS_SEEN_SQL}`
+        );
+        // 本地副本总数（2026-10-08）：删除账号的确认弹窗要告诉用户会清掉多少本地数据。
+        // 走 copies 的主键前缀（account_id, folder, uid），是索引区间计数，几千行也是毫秒级。
+        const localStmt = ctx.db.prepare(
+          "SELECT COUNT(*) AS n FROM copies WHERE account_id = ?"
         );
         return json(
           res,
@@ -765,6 +899,7 @@ export function createApiServer(ctx: WebmailContext): Server {
             smtpSecure: a.smtpSecure,
             username: ctx.credentials.get(a.id)?.username ?? "",
             unread: (unreadStmt.get(a.id) as { n: number }).n,
+            localMessages: (localStmt.get(a.id) as { n: number }).n,
           }))
         );
       }
@@ -772,7 +907,13 @@ export function createApiServer(ctx: WebmailContext): Server {
       // 新增账号：先连接测试（IMAP 登录 + SMTP verify）通过才落盘
       if (req.method === "POST" && path === "/accounts") {
         const body = (await readBody(req)) as AddAccountInput;
-        return json(res, 201, await addAccount(ctx, body));
+        const summary = await addAccount(ctx, body);
+        // 立刻为该账号起一轮同步（不等待）：新账号的首封邮件不必等 60s 定时器，
+        // 而且首轮是「最新优先」的倒序回填——几秒内列表里就有最近的邮件（2026-10-08）
+        void runSync(ctx, summary.id).catch((err) =>
+          console.error(`[webmaild] 新账号 ${summary.id} 首次同步失败：`, err)
+        );
+        return json(res, 201, summary);
       }
 
       // 远程图片白名单（4.4）：全局设置，账号管理弹窗里维护；写后即时生效
@@ -791,7 +932,19 @@ export function createApiServer(ctx: WebmailContext): Server {
       // 修改账号（2026-10-06）：备注名 / 发件人姓名 / 连接字段；连接字段变了先做连接测试
       if (accountMatch && req.method === "PUT") {
         const body = (await readBody(req)) as UpdateAccountInput;
-        return json(res, 200, await updateAccount(ctx, decodeURIComponent(accountMatch[1]), body));
+        const id = decodeURIComponent(accountMatch[1]);
+        const before = ctx.accounts.get(id);
+        const summary = await updateAccount(ctx, id, body);
+        // 同步文件夹白名单变了 → 立刻按新白名单跑一轮（新增的文件夹当场开始回填，
+        // 不必等 60s 定时器；2026-10-08）
+        const foldersChanged =
+          !!before && before.folders.slice().sort().join("\u0000") !== summary.folders.slice().sort().join("\u0000");
+        if (foldersChanged) {
+          void runSync(ctx, id).catch((err) =>
+            console.error(`[webmaild] 账号 ${id} 白名单变更后同步失败：`, err)
+          );
+        }
+        return json(res, 200, summary);
       }
 
       if (req.method === "GET" && path === "/messages") {

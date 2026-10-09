@@ -3,7 +3,13 @@ import { join } from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AccountError, addAccount, deleteAccount, normalizeAccountInput } from "../src/accounts.js";
+import {
+  ACCOUNT_COLOR_PALETTE,
+  AccountError,
+  addAccount,
+  deleteAccount,
+  normalizeAccountInput,
+} from "../src/accounts.js";
 import { createApiServer } from "../src/api.js";
 import type { WebmailAccountsFile } from "../src/types.js";
 import { makeContext, type TestContext } from "./context.js";
@@ -113,6 +119,36 @@ describe("账号管理：输入校验（normalizeAccountInput）", () => {
         new Set()
       )
     ).toThrow("同步文件夹");
+  });
+
+  /**
+   * 缺省色必须随已有账号变化（2026-10-09 用户报「账号指示器里多个账号颜色没有区别」）：
+   * 以前缺省写死 #0ea5e9，从界面加的账号全是同一个色，色点等于没有信息。
+   */
+  it("颜色：显式指定原样保留；缺省取未被占用的色板色，占满后轮转仍在色板内", () => {
+    const base = {
+      displayName: "x",
+      email: "a@b.c",
+      imapHost: "h",
+      imapPort: 993,
+      imapSecure: true,
+      smtpHost: "h",
+      smtpPort: 465,
+      smtpSecure: true,
+      password: "p",
+    };
+    expect(normalizeAccountInput({ ...base, color: "#123456" }, new Set()).account.color).toBe(
+      "#123456"
+    );
+    expect(normalizeAccountInput(base, new Set()).account.color).toBe("cyan");
+    expect(normalizeAccountInput(base, new Set(), ["cyan", "violet"]).account.color).toBe("orange");
+    // 大小写/空白归一：已占用的颜色名照样算占用
+    expect(normalizeAccountInput(base, new Set(), [" CYAN "]).account.color).toBe("violet");
+    // 历史缺省色 #0ea5e9 视作 cyan 占位（否则新账号又会拿到同一种蓝）
+    expect(normalizeAccountInput(base, new Set(), ["#0EA5E9"]).account.color).toBe("violet");
+    expect(ACCOUNT_COLOR_PALETTE).toContain(
+      normalizeAccountInput(base, new Set(), ACCOUNT_COLOR_PALETTE).account.color
+    );
   });
 });
 

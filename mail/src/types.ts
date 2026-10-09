@@ -54,8 +54,18 @@ export interface SyncResult {
   folder: string;
   /** UIDVALIDITY 变化导致该文件夹索引重建 */
   rebuilt: boolean;
+  /** 本次入库总数（增量 + 历史回填） */
   fetched: number;
+  /**
+   * 其中属于**历史回填**的封数（2026-10-08 新增）。
+   * ⚠ 回填的旧邮件不进 `ingested`、也不参与前端 lastNewMail 判定：
+   *   前者会把几千封历史邮件投成 judge/command 任务（贵且无意义），
+   *   后者会让「翻旧账」被误报成「收到 N 封新邮件」。
+   */
+  backfilled: number;
+  /** 该文件夹历史回填还剩多少封（0 = 已回填完；进度显示用） */
+  backfillRemaining: number;
   flagsUpdated: number;
-  /** 本次新入库的邮件（库键 + 是否首次出现）；触发接线用它投 judge/command 任务 */
+  /** 本次**增量**（新邮件）入库的邮件（库键 + 是否首次出现）；触发接线用它投 judge/command */
   ingested: { messageId: string; created: boolean }[];
 }
