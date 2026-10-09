@@ -154,7 +154,9 @@ describe("addAccount：落盘前清掉同 id 的残留状态（已被污染的�
         smtpHost: "smtp.qq.com",
         smtpPort: 465,
         smtpSecure: true,
-        password: "authcode",
+        // 占位符，非真实凭据：这里只需要一个非空串过校验（addAccount 会拒绝空密码）。
+        // 曾用 "authcode" 导致 GitGuardian 误判为 SMTP 凭据泄露，故改为一眼可辨的假值。
+        password: "FIXTURE-NOT-A-REAL-SECRET",
       },
       { test: false }
     );
