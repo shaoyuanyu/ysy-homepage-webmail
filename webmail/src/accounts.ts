@@ -58,13 +58,22 @@ const EMAIL_RE = /^[^\s@,;<>]+@[^\s@,;<>]+$/;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /**
- * 账号色板（MAIL-AGENT.md 4.2）：青 / 紫 / 橙 / 玫红 / 蓝绿——避开等级配色（红蓝绿琥珀）
+ * 账号色板（MAIL-AGENT.md 4.2）：青 / 玫红 / 紫 / 橙 / 蓝绿——避开等级配色（红蓝绿琥珀）
  * 与邮件页自己的语义色（未读蓝、方向 emerald/amber、星标前景色）。
  *
+ * ⚠ **数组顺序 = 分配顺序 = 「每次取离已用色最远的那个」贪心解**（浅色 600 档 OKLab ΔE：
+ *   cyan→pink 31.1、再 violet 24.5、再 orange 15.4、最后 teal 6.9）。所以第 1、2 个账号
+ *   拿到的是色板里差距最大的一对（31.1），而不是随便两个邻近色；`nextAccountColor()` 直接
+ *   按顺序取第一个未占用的即可，不必再算距离。
+ *   ⚠ 唯一的弱项是**第 5 个**（teal 与 cyan ΔE 只有 6.9）——要到第 5 个账号才会遇到；
+ *     真要连它也修掉，把 teal 换成 brown(#78350f/#b45309，ΔE 24.1/20.4) 或 lime(21.1/23.8)，
+ *     但要先想清楚与「不收绿/琥珀」的约束怎么取舍（见 MAIL-AGENT.md 4.2）。
+ *
  * ⚠ 颜色名（不是 hex）由前端 `components/mail/account-dot.ts` 的 `ACCOUNT_DOT` 映射成
- *   整串静态类名（浅色 600 / 深色 400 两档），两处是同一套名字，**改动必须同步**。
+ *   整串静态类名（浅色 600 / 深色 400 两档），两处是同一套名字**且同一顺序**，
+ *   **改动必须同步**。
  */
-export const ACCOUNT_COLOR_PALETTE = ["cyan", "violet", "orange", "pink", "teal"] as const;
+export const ACCOUNT_COLOR_PALETTE = ["cyan", "pink", "violet", "orange", "teal"] as const;
 
 /**
  * 历史遗留色 → 色板名：老版本的缺省色是写死的 `#0ea5e9`（天蓝），避让时必须把它当成
@@ -92,6 +101,47 @@ export function nextAccountColor(used: Iterable<string>): string {
     ACCOUNT_COLOR_PALETTE.find((c) => !taken.has(c)) ??
     ACCOUNT_COLOR_PALETTE[taken.size % ACCOUNT_COLOR_PALETTE.length]
   );
+}
+
+/**
+ * 撞色自动修复（2026-10-09 用户要求「不要手动分配」）：**同色账号里后出现的**改取一个
+ * 未被占用的色（就地改传入的数组，返回被重新分配的账号 id）。
+ *
+ * 存在的理由：缺省色曾经是常量 `#0ea5e9`，那批历史账号到现在还是同一个色——光靠「新增时
+ * 避让」修不了存量，而让用户挨个手动改正是用户嫌麻烦的那一步。webmaild 启动读注册表时
+ * 调用一次并落盘（幂等：修完就没有重复色，再启动不再动）。
+ */
+export function repairAccountColors(accounts: WebmailAccount[]): string[] {
+  const used: string[] = [];
+  const fixed: string[] = [];
+  for (const a of accounts) {
+    const key = accountColorKey(a.color ?? "");
+    if (key && !used.includes(key)) {
+      used.push(key);
+      continue;
+    }
+    const next = nextAccountColor(used);
+    used.push(accountColorKey(next));
+    // ⚠ 只有真的换了色才算「修过」：账号数超过色板长度时（≥6 个）撞色不可避免，
+    //   缺省轮转给出的可能还是原色——那时不该每次启动都重写一遍注册表、刷一条日志。
+    if (accountColorKey(next) === key) continue;
+    a.color = next;
+    fixed.push(a.id);
+  }
+  return fixed;
+}
+
+/**
+ * 启动钩子：修注册表里的撞色并原子落盘。返回被重新分配的账号 id（空 = 无需改动、不写盘）。
+ * ⚠ 只改 `color` 一个字段，其余内容原样写回（`{...raw, accounts}`）。
+ */
+export function repairAccountColorsFile(dataDir: string, accounts: WebmailAccount[]): string[] {
+  const fixed = repairAccountColors(accounts);
+  if (fixed.length === 0) return fixed;
+  const file = join(dataDir, "accounts.json");
+  const raw = JSON.parse(readFileSync(file, "utf8")) as WebmailAccountsFile;
+  atomicWriteJson(file, { ...raw, accounts });
+  return fixed;
 }
 
 /** 从邮箱地址推导账号 id（本地部分小写化、非法字符转 -；冲突时追加 -2/-3…） */

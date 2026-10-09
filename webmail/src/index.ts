@@ -3,6 +3,7 @@ import { openDb } from "../../mail/src/db.js";
 import { hasPendingBackfill } from "../../mail/src/fetcher.js";
 import { backfillRefs } from "../../mail/src/message.js";
 import { createApiServer, isFullSyncInFlight, runSync, type WebmailContext } from "./api.js";
+import { repairAccountColorsFile } from "./accounts.js";
 import { loadAccounts, loadCredentials, webmailDataDir } from "./config.js";
 import { MIRROR_SWEEP_MS, mirrorDrafts } from "./draft-mirror.js";
 
@@ -21,6 +22,15 @@ const BACKFILL_TICK_MS = Number(process.env.WEBMAIL_BACKFILL_TICK_MS ?? 1500);
 async function main() {
   const dataDir = webmailDataDir();
   const { accounts, remoteImageDomains } = loadAccounts(dataDir);
+  // 撞色自动修复（2026-10-09）：缺省色写死年代留下的账号至今同色，用户不该为此手动改。
+  const recolored = repairAccountColorsFile(dataDir, accounts);
+  if (recolored.length > 0) {
+    console.log(
+      `[webmaild] 账号颜色撞色已自动重新分配：${recolored
+        .map((id) => `${id}=${accounts.find((a) => a.id === id)?.color}`)
+        .join("、")}`
+    );
+  }
   const credentialsFile = loadCredentials(dataDir);
   const credentials = new Map(Object.entries(credentialsFile));
   const db = openDb(join(dataDir, "webmail.db"));

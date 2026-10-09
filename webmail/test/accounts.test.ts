@@ -9,6 +9,7 @@ import {
   addAccount,
   deleteAccount,
   normalizeAccountInput,
+  repairAccountColors,
 } from "../src/accounts.js";
 import { createApiServer } from "../src/api.js";
 import type { WebmailAccountsFile } from "../src/types.js";
@@ -124,8 +125,9 @@ describe("账号管理：输入校验（normalizeAccountInput）", () => {
   /**
    * 缺省色必须随已有账号变化（2026-10-09 用户报「账号指示器里多个账号颜色没有区别」）：
    * 以前缺省写死 #0ea5e9，从界面加的账号全是同一个色，色点等于没有信息。
+   * 顺序 = 「每次取离已用色最远」贪心解（cyan → pink → violet → orange → teal）。
    */
-  it("颜色：显式指定原样保留；缺省取未被占用的色板色，占满后轮转仍在色板内", () => {
+  it("颜色：显式指定原样保留；缺省取色板里第一个未占用的色（顺序 = 差异最大优先）", () => {
     const base = {
       displayName: "x",
       email: "a@b.c",
@@ -141,14 +143,46 @@ describe("账号管理：输入校验（normalizeAccountInput）", () => {
       "#123456"
     );
     expect(normalizeAccountInput(base, new Set()).account.color).toBe("cyan");
-    expect(normalizeAccountInput(base, new Set(), ["cyan", "violet"]).account.color).toBe("orange");
+    // 第 2 个账号拿到的是色板里离 cyan 最远的那个（ΔE 31.1），不是紧邻的 violet
+    expect(normalizeAccountInput(base, new Set(), ["cyan"]).account.color).toBe("pink");
+    expect(normalizeAccountInput(base, new Set(), ["cyan", "pink"]).account.color).toBe("violet");
+    expect(normalizeAccountInput(base, new Set(), ["cyan", "violet"]).account.color).toBe("pink");
     // 大小写/空白归一：已占用的颜色名照样算占用
-    expect(normalizeAccountInput(base, new Set(), [" CYAN "]).account.color).toBe("violet");
+    expect(normalizeAccountInput(base, new Set(), [" CYAN ", "PINK"]).account.color).toBe("violet");
     // 历史缺省色 #0ea5e9 视作 cyan 占位（否则新账号又会拿到同一种蓝）
-    expect(normalizeAccountInput(base, new Set(), ["#0EA5E9"]).account.color).toBe("violet");
+    expect(normalizeAccountInput(base, new Set(), ["#0EA5E9"]).account.color).toBe("pink");
     expect(ACCOUNT_COLOR_PALETTE).toContain(
       normalizeAccountInput(base, new Set(), ACCOUNT_COLOR_PALETTE).account.color
     );
+  });
+
+  /**
+   * 撞色自动修复（2026-10-09 用户要求「不要手动分配」）：存量账号（缺省色写死年代进来的）
+   * 在 webmaild 启动时被自动分开，不需要用户挨个进弹窗改色。
+   */
+  it("颜色：撞色自动修复——同色只改后面的那个，修完再跑一次幂等", () => {
+    const mk = (id: string, color: string) =>
+      ({ id, displayName: id, email: `${id}@x.c`, color }) as unknown as Parameters<
+        typeof repairAccountColors
+      >[0][number];
+    // 两个账号都是历史缺省色 → 第二个改取「离 cyan 最远」的 pink
+    const dup = [mk("me", "#0ea5e9"), mk("other", "#0ea5e9")];
+    expect(repairAccountColors(dup)).toEqual(["other"]);
+    expect(dup.map((a) => a.color)).toEqual(["#0ea5e9", "pink"]);
+    // 幂等：再跑一次没有任何改动、也不写盘
+    expect(repairAccountColors(dup)).toEqual([]);
+    // 三色同值 → 后两个分别拿到 pink / violet；第一个原样不动
+    const triple = [mk("a", "cyan"), mk("b", "cyan"), mk("c", "cyan")];
+    expect(repairAccountColors(triple)).toEqual(["b", "c"]);
+    expect(triple.map((a) => a.color)).toEqual(["cyan", "pink", "violet"]);
+    // 空色（手改配置漏了 color）也算撞色，补一个
+    const blank = [mk("a", "cyan"), mk("b", "")];
+    expect(repairAccountColors(blank)).toEqual(["b"]);
+    expect(blank[1].color).toBe("pink");
+    // 账号数超过色板长度：撞色不可避免，但不能每次启动都重写注册表（无改动 = 不算修复）
+    const six = ACCOUNT_COLOR_PALETTE.map((c, i) => mk(`a${i}`, c));
+    six.push(mk("a5", ACCOUNT_COLOR_PALETTE[0]));
+    expect(repairAccountColors(six)).toEqual([]);
   });
 });
 
