@@ -28,10 +28,15 @@ async function api(path: string, body?: unknown): Promise<Response> {
   });
 }
 
-async function listIds(): Promise<{ messageId: string; seen: boolean; flagged: boolean }[]> {
+async function listIds(): Promise<
+  { messageId: string; seen: boolean; flagged: boolean; hasReadState: boolean }[]
+> {
   const res = await fetch(`${base}/messages`);
-  return ((await res.json()) as { items: { messageId: string; seen: boolean; flagged: boolean }[] })
-    .items;
+  return (
+    (await res.json()) as {
+      items: { messageId: string; seen: boolean; flagged: boolean; hasReadState: boolean }[];
+    }
+  ).items;
 }
 
 beforeAll(async () => {
@@ -177,57 +182,72 @@ describe("webmaild 写操作", () => {
     expect((await listIds()).filter((i) => !i.seen).length).toBe(0);
   });
 
-  it("批量标记（多选，2026-10-07）：一批 Message-ID 的全部副本一起写，每文件夹一次 STORE", async () => {
-    // 干净的起点：全部标为未读（前面的用例把状态推到了别处）
-    const ids = (await listIds()).map((i) => i.messageId);
-    await api("/flags", { messageIds: ids, seen: false });
-    expect((await listIds()).every((i) => !i.seen)).toBe(true);
-
-    // 这一封当前有几个副本要先查：**同一容器里前面的用例动过副本**（移动/删除），
-    // 写死 2 会随用例顺序变红（2026-10-07 首跑实测）。口径是"所有副本一起写"（红线 8），
-    // 所以期望值就是当下实际的副本数。
-    const listed = (await (await fetch(`${base}/messages`)).json()) as {
-      items: { messageId: string; copies: { accountId: string; folder: string; uid: number }[] }[];
-    };
-    const target = listed.items.find((i) => i.messageId === MESSAGE_ID);
-    expect(target).toBeTruthy();
-    const expectedCopies = target!.copies.length;
-    expect(expectedCopies).toBeGreaterThanOrEqual(1);
-
-    // 批量标已读：对该消息的**全部副本**一起写（红线 8）
+  /**
+   * 批量标记（多选，2026-10-07；**2026-10-10 第九轮改写口径**）。
+   *
+   * 旧版断言「一批 Message-ID 的**全部副本**一起写（红线 8）」——现在那正是要防的事：
+   * `seen` 只写**承载已读状态的副本**（服务端 `readCopiesOf`：收件箱优先，没有收件箱副本
+   * 时才认垃圾副本）。所以本用例用「只剩回收站副本」的 mid:w01 验：回收站既不是收件箱、
+   * 也不是垃圾 → 一次 IMAP 写都不发。（垃圾副本**会**被写——那是第九轮用户要的
+   * 「垃圾也对齐协议」，正面契约见下一条用例。）
+   */
+  it("批量标记（多选）：只写承载已读状态的副本；回收站副本一个字都不改", async () => {
+    // ① 只剩回收站副本的 mid:w01（前面用例把它移进了 Trash）：一次写回都不该发生
+    const trashBefore = [...(await readAllFlags(dovecot, "test", "test", "Trash")).values()];
     const res = (await (
-      await api("/flags", { messageIds: [MESSAGE_ID], seen: true })
+      await api("/flags", { messageIds: [MESSAGE_ID], seen: false })
     ).json()) as { updated: number; messages: number; skipped: unknown[] };
-    expect(res.messages).toBe(1);
-    expect(res.updated).toBe(expectedCopies);
     expect(res.skipped).toEqual([]);
+    expect(res.updated).toBe(0); // 没有 INBOX 副本 → 一次 IMAP 写都不发
+    expect([...(await readAllFlags(dovecot, "test", "test", "Trash")).values()]).toEqual(trashBefore);
+    const listed = (await (await fetch(`${base}/messages`)).json()) as {
+      items: { messageId: string; seen: boolean; hasReadState: boolean; copies: unknown[] }[];
+    };
+    const w01 = listed.items.find((i) => i.messageId === MESSAGE_ID);
+    expect(w01?.hasReadState, "回收站不是「承载已读状态」的位置 → 没有已读动作可给").toBe(false);
+    expect(w01?.seen, "没有可承载状态的副本 = 恒为已读").toBe(true);
 
-    // 服务端确实写了 \Seen ——**按这封邮件副本的 UID 精确核对**
-    // （不能断言"整个 INBOX 都已读"：同容器里还有别的用例留下的未读邮件）
+    // ② 有 INBOX 副本的消息：照常批量写（新投一封到两个账号的 INBOX，避免受前面用例影响）
+    await deliverFixtures(dovecot, "test", "test", ["05.eml"]);
+    await deliverFixtures(dovecot, "test2", "test2", ["05.eml"]);
+    await api("/sync");
+    const fresh = (await (await fetch(`${base}/messages`)).json()) as {
+      items: {
+        messageId: string;
+        seen: boolean;
+        hasReadState: boolean;
+        copies: { accountId: string; folder: string; uid: number }[];
+      }[];
+    };
+    const target = fresh.items.find(
+      (i) => i.copies.filter((c) => c.folder.toUpperCase() === "INBOX").length === 2,
+    );
+    expect(target, "新投的 05.eml 应有两个 INBOX 副本").toBeTruthy();
+    expect(target!.seen).toBe(false);
+
+    const seenRes = (await (
+      await api("/flags", { messageIds: [target!.messageId], seen: true })
+    ).json()) as { updated: number; messages: number; skipped: unknown[] };
+    expect(seenRes.messages).toBe(1);
+    expect(seenRes.updated).toBe(2); // 两个账号的 INBOX 各一份
+    expect(seenRes.skipped).toEqual([]);
+    // 服务端按 UID 精确核对
     const acc1 = await readAllFlags(dovecot, "test", "test", "INBOX");
     const acc2 = await readAllFlags(dovecot, "test2", "test2", "INBOX");
-    const flagsOf = (accountId: string) => {
-      const copy = target!.copies.find((c) => c.accountId === accountId);
-      if (!copy) return undefined; // 该账号的副本已被前面的用例移走/删掉
-      return (accountId === "acc1" ? acc1 : acc2).get(copy.uid);
-    };
-    for (const accountId of ["acc1", "acc2"]) {
-      const flags = flagsOf(accountId);
-      if (flags === undefined) continue;
+    for (const c of target!.copies.filter((x) => x.folder.toUpperCase() === "INBOX")) {
+      const flags = (c.accountId === "acc1" ? acc1 : acc2).get(c.uid);
       expect(flags ?? []).toContain("\\Seen");
     }
-    // 本地索引同步：w01 已读、其余仍未读（只有它被批量标记）
     const after = await listIds();
-    expect(after.find((i) => i.messageId === MESSAGE_ID)?.seen).toBe(true);
-    expect(after.filter((i) => i.messageId !== MESSAGE_ID).every((i) => !i.seen)).toBe(true);
+    expect(after.find((i) => i.messageId === target!.messageId)?.seen).toBe(true);
 
-    // 批量星标 + 取消星标（星标往返不触碰 \Seen）
-    await api("/flags", { messageIds: ids, flagged: true });
-    expect((await listIds()).every((i) => i.flagged)).toBe(true);
-    await api("/flags", { messageIds: ids, flagged: false });
-    expect((await listIds()).every((i) => !i.flagged)).toBe(true);
+    // 批量星标 + 取消星标（星标不受 INBOX 限制：垃圾邮件也能加星）
+    await api("/flags", { messageIds: [target!.messageId], flagged: true });
+    expect((await listIds()).find((i) => i.messageId === target!.messageId)?.flagged).toBe(true);
+    await api("/flags", { messageIds: [target!.messageId], flagged: false });
+    expect((await listIds()).find((i) => i.messageId === target!.messageId)?.flagged).toBe(false);
     // \Seen 没被星标往返抹掉（红线 2：只增删目标标记）
-    expect((await listIds()).find((i) => i.messageId === MESSAGE_ID)?.seen).toBe(true);
+    expect((await listIds()).find((i) => i.messageId === target!.messageId)?.seen).toBe(true);
 
     // 参数校验：既没有 messageId 也没有 messageIds → 400；超过 500 封 → 400
     const noId = await api("/flags", { seen: true });
@@ -242,6 +262,95 @@ describe("webmaild 写操作", () => {
       await api("/flags", { messageIds: ["mid:nope@test.local"], seen: true })
     ).json()) as { updated: number; messages: number };
     expect(gone).toEqual({ updated: 0, messages: 0, skipped: [] });
+  });
+
+  /**
+   * 「垃圾邮件也有已读/未读」的正面契约（2026-10-10 第九轮用户定稿「对齐协议」）。
+   *
+   * 协议上 `\Seen` 属于**副本**：垃圾箱里那份也有自己的状态。但**未读数字仍然只数收件箱**
+   * （`/accounts` 的 `unread`、大标题角标、底栏）。这条契约因此有两面，本用例两头都锁：
+   * ① 站内：只躺在垃圾箱里的未读邮件 `seen = false` / `hasReadState = true`，
+   *    `folder + unseen` 就地筛得到，而它不进任何未读数字；
+   * ② 写回：「标为已读/未读」**真的去写服务商的垃圾副本**（本地索引随之更新）；
+   * ③ 「全部标为已读」：不带 `folders` 仍然只清收件箱（第七轮口径不变），
+   *    带上垃圾文件夹才清垃圾——这正是前端「垃圾」tab 的做法（作用域跟着 tab 走）。
+   */
+  it("垃圾邮件也有已读/未读：能标、能筛、不进未读数字；一键已读按 folders 作用域", async () => {
+    const acc1 = tc.ctx.accounts.get("acc1")!;
+    const foldersBefore = acc1.folders;
+    const MID = "mid:w06@test.local";
+    const junkQuery = `folder=${encodeURIComponent("acc1|Junk")}`;
+    // 直接把夹具 APPEND 进 Junk：这封在收件箱没有任何副本，正是「只躺在垃圾箱里」那种
+    await deliverFixtures(dovecot, "test", "test", ["06.eml"], "Junk");
+    // ⚠ 垃圾文件夹默认不在同步白名单里（test/context.ts 的 folders）——临时加进来才索引得到，
+    //   否则本地连一行副本都没有，也就无从谈「写它的已读态」
+    acc1.folders = [...foldersBefore, "Junk"];
+    try {
+      await api("/sync");
+      const junkUid = [...(await readAllFlags(dovecot, "test", "test", "Junk")).keys()][0]!;
+
+      // ① 行上有已读/未读这回事：未读 + 有可承载状态的副本
+      const row = ((await (await fetch(`${base}/messages?${junkQuery}`)).json()) as {
+        items: { messageId: string; seen: boolean; hasReadState: boolean }[];
+      }).items.find((i) => i.messageId === MID);
+      expect(row, "「垃圾」tab 应能看到这封").toBeTruthy();
+      expect(row!.seen, "垃圾副本自己的状态：未读").toBe(false);
+      expect(row!.hasReadState, "垃圾副本承载已读状态 → 该给「标为已读」").toBe(true);
+
+      // ② 它不进收件箱的未读：不带 folder 的未读筛选与账号角标都不认它
+      const inboxUnseen = ((await (await fetch(`${base}/messages?filter=unseen`)).json()) as {
+        items: { messageId: string }[];
+      }).items;
+      expect(inboxUnseen.map((i) => i.messageId)).not.toContain(MID);
+      const accounts = (await (await fetch(`${base}/accounts`)).json()) as {
+        id: string;
+        unread: number;
+      }[];
+      expect(accounts.find((a) => a.id === "acc1")?.unread, "垃圾未读不算进角标").toBe(0);
+      // 而「垃圾」tab 里就地筛未读，筛得到它
+      const junkUnseen = ((await (
+        await fetch(`${base}/messages?${junkQuery}&filter=unseen`)
+      ).json()) as { items: { messageId: string }[] }).items;
+      expect(junkUnseen.map((i) => i.messageId)).toEqual([MID]);
+
+      // ③ 标为已读：真的写服务商的垃圾副本（本地索引同步）
+      const marked = (await (
+        await api("/flags", { messageId: MID, seen: true })
+      ).json()) as { updated: number };
+      expect(marked.updated, "只写垃圾副本那一份").toBe(1);
+      expect((await readAllFlags(dovecot, "test", "test", "Junk")).get(junkUid) ?? []).toContain("\\Seen");
+      // ⚠ 用「垃圾」tab 的查询核对本地索引：只躺在垃圾里的邮件**不在「全部」里**
+      //   （第六轮：垃圾邮件不算「邮件」，`/messages` 不带 folder 时排除它）
+      expect(
+        ((await (await fetch(`${base}/messages?${junkQuery}`)).json()) as {
+          items: { messageId: string; seen: boolean }[];
+        }).items.find((i) => i.messageId === MID)?.seen,
+      ).toBe(true);
+      // 往返回未读：撤销同样落到服务商（否则界面说未读、服务器说已读，刷新就不一致）
+      await api("/flags", { messageId: MID, seen: false });
+      expect((await readAllFlags(dovecot, "test", "test", "Junk")).get(junkUid) ?? []).not.toContain("\\Seen");
+
+      // ④ 一键已读：不给 folders = 只清收件箱，垃圾那份一个字都不动
+      await api("/mark-all-read", {});
+      expect(
+        (await readAllFlags(dovecot, "test", "test", "Junk")).get(junkUid) ?? [],
+        "不带 folders 的一键已读不该去改垃圾箱里的 \\Seen",
+      ).not.toContain("\\Seen");
+      // 给 folders = 只清这个范围内的未读（前端「垃圾」tab 的做法）
+      const scoped = (await (
+        await api("/mark-all-read", { folders: ["acc1|Junk"] })
+      ).json()) as { updated: number; messages: number };
+      expect(scoped.messages).toBe(1);
+      expect((await readAllFlags(dovecot, "test", "test", "Junk")).get(junkUid) ?? []).toContain("\\Seen");
+    } finally {
+      acc1.folders = foldersBefore;
+      // ⚠ 复位：垃圾箱必须回到空——后面的用例断言「Junk 里只有它自己搬的那一封」
+      for (const [uid] of await readAllFlags(dovecot, "test", "test", "Junk")) {
+        await api("/move", { copies: [{ accountId: "acc1", folder: "Junk", uid }], to: "INBOX" });
+      }
+      await api("/sync");
+      expect((await readAllFlags(dovecot, "test", "test", "Junk")).size).toBe(0);
+    }
   });
 
   /**

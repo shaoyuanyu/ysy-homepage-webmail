@@ -145,7 +145,10 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
   const list = async (query: string) => {
     const res = await fetch(`${base}/messages?${query}`);
     expect(res.status).toBe(200);
-    return (await res.json()) as { items: { messageId: string }[] };
+    // 类型带上已读态相关字段：第九轮起「垃圾」tab 里也验行自己的 seen / hasReadState
+    return (await res.json()) as {
+      items: { messageId: string; seen: boolean; hasReadState: boolean }[];
+    };
   };
 
   beforeAll(async () => {
@@ -225,21 +228,30 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
   });
 
   /**
-   * 未读口径（2026-10-10 第六轮，用户报障）：**未读 = 收件箱未读**，与 `/accounts` 的
-   * `unread`、底栏统计、大标题角标四处同一个数。旧口径「存在任一副本无 \Seen」会把垃圾箱
-   * 里的未读算进来（用户账号 Junk 正好 5 封未读 → 开关写 2、点开列出 7 封）。
-   * ⚠ 反向验证：把 UNSEEN_SQL 改回旧口径，本用例三条断言立刻变红。
+   * 未读的两面（2026-10-10 第九轮用户定稿「对齐协议」）：
+   * - **数字**只数收件箱：`/accounts` 的 `unread`、大标题角标、底栏、「不带 `folder` 的
+   *   `filter=unseen`」四处同口径（第六轮定稿，第九轮没有改）；
+   * - **垃圾箱里的未读照样是未读**：给了 `folder`（「垃圾」tab）时 `filter=unseen` 就地筛出
+   *   垃圾里未读的那几封，行的 `seen` / `hasReadState` 也由垃圾副本决定。
+   * ⚠ 反向验证：去掉 `unseenClause` 的 folder 分支 → 「垃圾」tab 的就地筛选立刻变空；
+   *   把不带 folder 的那条改回旧的「任一副本无 \Seen」→ 未读筛选会多出垃圾那两封。
    */
-  it("未读 = 收件箱未读：垃圾里的未读副本不算，按垃圾文件夹筛也筛不出未读", async () => {
-    // 合并视图里收件箱未读 = mid:inbox@x 与 mid:both@x（mid:sent@x 是已读的已发送）
+  it("未读：数字只数收件箱，但「垃圾」tab 里按 folder 筛时垃圾未读照样算", async () => {
+    // 合并视图（不给 folder）里收件箱未读 = mid:inbox@x 与 mid:both@x（mid:sent@x 已读）
     const unseen = await list("filter=unseen");
     expect(unseen.items.map((i) => i.messageId).sort()).toEqual(["mid:both@x", "mid:inbox@x"]);
-    // 只躺在垃圾里的 mid:junk@x 虽然未读，但不是「收件箱未读」→ 不进未读筛选
+    // 只躺在垃圾里的 mid:junk@x 虽然未读，但**不算收件箱未读** → 不进这个筛选
     expect(unseen.items.map((i) => i.messageId)).not.toContain("mid:junk@x");
-    // 显式按垃圾文件夹 + 未读 = 空（前端「垃圾」tab 据此禁用「未读」开关）
+    // 显式按垃圾文件夹 + 未读 = 垃圾箱里未读的那几封（「垃圾」tab 的就地筛选）
     const junkUnseen = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}&filter=unseen`);
-    expect(junkUnseen.items).toEqual([]);
-    // 搜索路径同口径
+    expect(junkUnseen.items.map((i) => i.messageId)).toEqual(["mid:junk@x"]);
+    // 行的已读态与筛选同判据：垃圾副本自己未读 → 不加粗，但**有**「标为已读」可给
+    expect(junkUnseen.items[0].seen).toBe(false);
+    expect(junkUnseen.items[0].hasReadState).toBe(true);
+    // 纯路径写法（跨账号同名垃圾文件夹）同样就地筛
+    const byPath = await list(`folder=${encodeURIComponent("垃圾邮件")}&filter=unseen`);
+    expect(byPath.items.map((i) => i.messageId).sort()).toEqual(["mid:acc2junk@x", "mid:junk@x"]);
+    // 搜索路径（JS matchFilter）同口径：不给 folder 时仍然只认收件箱
     const searched = await list(`q=${encodeURIComponent("主题")}&filter=unseen`);
     expect(searched.items.map((i) => i.messageId).sort()).toEqual(["mid:both@x", "mid:inbox@x"]);
   });
@@ -353,11 +365,48 @@ describe("列表的文件夹筛选（HTTP + 内存库）", () => {
     expect(acc2Sent.items.map((i) => i.messageId)).toEqual(["mid:both@x"]);
   });
 
-  it("文件夹 + 未读组合筛选：垃圾文件夹里没有「收件箱未读」这回事（= 空）", async () => {
-    // 2026-10-10 第六轮：未读只认 INBOX 副本，而这条查询限定在垃圾文件夹里 → 交集必空。
-    // 前端因此不在「垃圾」tab 里提供「未读」开关（禁用）。
-    const r = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}&filter=unseen`);
-    expect(r.items).toEqual([]);
+  /**
+   * 一封邮件只有一个已读态（2026-10-10 第九轮定稿的收敛）：同一封信同时有收件箱与垃圾副本
+   * 时**以收件箱副本为准**——「垃圾」tab 里那一行也不跟着垃圾副本走。
+   *
+   * 为什么这样收敛：若按"每份副本各显示各的"，同一封信会在「收件」里粗、在「垃圾」里不粗，
+   * 而详情页只能改其中一份——正是用户第七轮报过的「同一个状态存在多处、只更新一处」。
+   * （实测用户数据里这种组合 0 条，但判据必须先定死，见 readCopiesOf 的注记。）
+   */
+  it("同时有收件箱与垃圾副本：两个 tab 显示同一个已读态（收件箱优先）", async () => {
+    // ① 收件箱那份未读、垃圾那份已读 → 两边都显示未读
+    seed("mid:bothboxes@x", "2026-10-09T00:00:00Z", [
+      { accountId: "acc1", folder: "垃圾邮件", uid: 12, flags: "\\Seen" },
+      { accountId: "acc1", folder: "INBOX", uid: 13 },
+    ]);
+    // ② 反过来：收件箱那份已读、垃圾那份未读 → 两边都显示已读（垃圾副本状态不参与）
+    seed("mid:bothboxes2@x", "2026-10-09T01:00:00Z", [
+      { accountId: "acc1", folder: "垃圾邮件", uid: 14 },
+      { accountId: "acc1", folder: "INBOX", uid: 15, flags: "\\Seen" },
+    ]);
+    try {
+      const junkTab = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}`);
+      const row1 = junkTab.items.find((i) => i.messageId === "mid:bothboxes@x");
+      expect(row1, "同时有收件箱副本的邮件也出现在垃圾 tab 里").toBeTruthy();
+      expect(row1!.seen, "收件箱那份未读 → 显示未读").toBe(false);
+      expect(row1!.hasReadState).toBe(true);
+      expect(
+        junkTab.items.find((i) => i.messageId === "mid:bothboxes2@x")!.seen,
+        "垃圾那份未读、收件箱那份已读 → 显示已读",
+      ).toBe(true);
+
+      // 就地筛未读用同一个判据：① 在，② 不在
+      const junkUnseen = await list(`folder=${encodeURIComponent("acc1|垃圾邮件")}&filter=unseen`);
+      const ids = junkUnseen.items.map((i) => i.messageId);
+      expect(ids).toContain("mid:bothboxes@x");
+      expect(ids).not.toContain("mid:bothboxes2@x");
+    } finally {
+      for (const id of ["mid:bothboxes@x", "mid:bothboxes2@x"]) {
+        ctx.db.prepare("DELETE FROM copies WHERE message_id = ?").run(id);
+        ctx.db.prepare("DELETE FROM messages WHERE message_id = ?").run(id);
+        ctx.db.prepare("DELETE FROM messages_fts WHERE message_id = ?").run(id);
+      }
+    }
   });
 
   it("搜索路径（q）与 SQL 路径同口径：限定文件夹后结果一致", async () => {

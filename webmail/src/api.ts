@@ -116,9 +116,29 @@ function messageOf(ctx: WebmailContext, messageId: string): MessageRow | undefin
     .get(messageId) as MessageRow | undefined;
 }
 
-function listItem(ctx: WebmailContext, row: MessageRow, names?: Map<string, string>) {
+function listItem(
+  ctx: WebmailContext,
+  row: MessageRow,
+  names?: Map<string, string>,
+  /** 本次查询显式给出的文件夹范围（「垃圾」tab 传它探测到的垃圾文件夹；其余视图不传），见 readCopiesOf */
+  readFolders?: FolderParam[] | null,
+  /** 详情页：没有视图上下文，按「收件箱优先、否则垃圾」兜底（见 readCopiesOf ③） */
+  readFallbackJunk = false,
+) {
   const copies = copiesOf(ctx, row.message_id);
-  const seen = copies.length > 0 && copies.every((c) => c.flags.split(" ").includes("\\Seen"));
+  /**
+   * `seen` = 「承载这份已读状态的副本」**全都有** `\Seen`（判据见 `readCopiesOf`，
+   * 那一段同时解释了为什么不是"任一副本"、也不是"每份副本各显示各的"）。
+   *
+   * 于是「行显示为未读」与「能被 `filter=unseen` 筛出来」始终是**同一个判据**
+   * （`unseenClause` 是它的 SQL 版），不会出现「加粗却筛不出来」的行——这是第六轮与
+   * 第九轮两次都踩到的同一个坑。
+   *
+   * ⚠ 配套：写回（`applyFlags` / `applyFlagsBatch` / `markAllRead`）必须用**同一个**
+   *   `readCopiesOf` 选目标，否则会出现「改了但界面不变」（或反过来）。
+   */
+  const readCopies = readCopiesOf(copies, readFolders, readFallbackJunk);
+  const seen = readCopies.every((c) => c.flags.split(" ").includes("\\Seen"));
   const flagged = copies.some((c) => c.flags.split(" ").includes("\\Flagged"));
   return {
     messageId: row.message_id,
@@ -133,6 +153,12 @@ function listItem(ctx: WebmailContext, row: MessageRow, names?: Map<string, stri
     size: row.size,
     truncated: row.truncated === 1,
     seen,
+    /**
+     * 有没有「可承载已读状态」的副本（见 `readCopiesOf`）——前端据此决定要不要渲染
+     * 「标为已读/未读」。收件 / 全部 / 搜索 = 收件箱副本；「垃圾」= 收件箱副本或垃圾副本；
+     * 发件 / 归档 / 自定义文件夹 = 没有（那些位置本来就没有已读语义）。
+     */
+    hasReadState: readCopies.length > 0,
     flagged,
     hasAttach: row.has_attach === 1,
     copies: copies.map((c) => ({ accountId: c.account_id, folder: c.folder, uid: c.uid })),
@@ -159,26 +185,84 @@ const NOT_DRAFT_SQL =
   "NOT EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND instr(' ' || c.flags || ' ', ' \\Draft ') > 0)";
 
 /**
- * 「未读」= 存在无 `\Seen` 的 **INBOX** 副本（2026-10-10 第六轮起；旧口径是「任一副本无 `\Seen`」）。
+ * 缺省读取范围 = **只认收件箱**。给 `unseenClause` / `unseenCopiesClause` 不传 `folders`
+ * 时就是它：收件 / 全部 / 搜索 / 发件 /「全部标为已读」都走这条。
  *
- * 全站只有一个「未读」：账号角标（`/accounts` 的 `unread` 只数 INBOX 副本）、底部状态栏、
- * 「全部标为已读」、本筛选，四处同口径。起因见 NOT_JUNK_ONLY_SQL 上方那段（用户报障：
- * 角标写 2、点开「未读」却列出 7 封——多出来的 5 封是垃圾箱里的未读信）。
- *
- * ⚠ **给了 `account` 时要连账号一起限定**（`unseenSql(accountIds)`）：角标是**逐账号**数的，
- *   不做限定就会漏出这种消息——A 账号的 INBOX 副本未读，而这封同时另有 B 账号的副本，
- *   于是「选 B + 未读」列出它、B 的角标却写 0（同一类不一致，只是换了个方向）。
- *   实测用户数据里这种组合当前为 0 条，但判定必须写成账号内命中。
+ * 「未读」在**全站只有一个数字**：账号角标（`/accounts` 的 `unread`）、大标题角标、底部
+ * 状态栏、「全部标为已读」，全部只数收件箱未读。这是用户 2026-10-10 第六轮报障后定稿的
+ * 口径（角标写 2、点开「未读」却列出 7 封——多出来的 5 封是垃圾箱里的未读信），
+ * 第九轮「垃圾也要有已读/未读」**不动这个数字**。
  */
-function unseenSql(accountIds: string[]): string {
-  const scope = accountIds.length
+const DEFAULT_READ_SCOPE: FolderParam[] = [{ account: "", path: "INBOX" }];
+
+/**
+ * 「未读」的 SQL 判据（**返回片段 + 占位符参数**，调用方必须**按返回的顺序**绑参）：
+ * 存在一份「承载已读状态的副本」（判据见 `readCopiesOf`）且它没有 `\Seen`。
+ *
+ * - 不给 `folders`（收件 / 全部 / 搜索）→ 退化成**收件箱未读**（`DEFAULT_READ_SCOPE`）；
+ * - 给了 `folders`（「垃圾」tab 传它探测到的垃圾文件夹）→ **收件箱优先、否则该范围内的
+ *   副本**：与行的加粗同判据，于是「垃圾」tab 里筛出来的正是那些显示为未读的行。
+ *
+ * ⚠ 第二分支里的「这封信没有收件箱副本」必须**同样带账号范围**：角标是逐账号数的，
+ *   不做限定就会漏出「A 账号收件箱未读、这封另有 B 账号副本」这种消息（实测 0 条，
+ *   但判定要写成账号内命中）。
+ * ⚠ 本函数（SQL 路径）与 `matchFilter` 里的 JS 版、`readCopiesOf` 的优先级必须**逐条同口径**。
+ */
+function unseenClause(
+  accountIds: string[],
+  folders: FolderParam[] = DEFAULT_READ_SCOPE,
+): { sql: string; params: unknown[] } {
+  const account = accountIds.length
     ? ` AND c.account_id IN (${accountIds.map(() => "?").join(", ")})`
     : "";
-  return `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id${scope} AND upper(trim(c.folder)) = 'INBOX' AND NOT (${HAS_SEEN_SQL}))`;
+  // 只认收件箱时不必绕「优先 / 否则」那一圈：直接就是今天的写法（占位符也与旧实现一致）
+  if (folders.length === 1 && !folders[0].account && isInboxFolder(folders[0].path)) {
+    return {
+      sql: `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id${account} AND upper(trim(c.folder)) = 'INBOX' AND NOT (${HAS_SEEN_SQL}))`,
+      params: [...accountIds],
+    };
+  }
+  const scope = folderClause(folders, "c");
+  const accountCi = accountIds.length
+    ? ` AND ci.account_id IN (${accountIds.map(() => "?").join(", ")})`
+    : "";
+  // 占位符顺序必须与下面 SQL 里出现的先后一致：c 的账号 → ci 的账号 → 范围
+  return {
+    sql: `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id${account} AND NOT (${HAS_SEEN_SQL}) AND ( upper(trim(c.folder)) = 'INBOX' OR ( ${scope.sql} AND NOT EXISTS (SELECT 1 FROM copies ci WHERE ci.message_id = m.message_id${accountCi} AND upper(trim(ci.folder)) = 'INBOX') ) ))`,
+    params: [...accountIds, ...accountIds, ...scope.params],
+  };
 }
 
-/** 不带账号范围时的写法（合并视图） */
-const UNSEEN_SQL = unseenSql([]);
+/**
+ * 同一判据的 **copies 级别**写法（`markAllRead` 直接扫 `copies` 表，没有 `messages m`
+ * 可以挂）：选中的 `c` 必须是「承载已读状态的、且没有 `\Seen`」的那份副本。
+ *
+ * - `folders` 缺省 = 只认收件箱 → 退化成第六轮的原句（`folder = 'INBOX' AND 无 \Seen`）；
+ * - 给了 `folders`（「垃圾」tab 的「全部标为已读」）→ 只动**在这范围内有副本**的邮件：
+ *   其收件箱副本（收件箱优先）、或（没有收件箱副本时）其范围内的副本。
+ *   ⚠ 不加「这封在范围内」这道限，垃圾 tab 里点「全部标为已读」会把整个收件箱清掉。
+ *
+ * ⚠ **不在这里限定账号**：账号范围由 `markAllRead` 用**消息级** EXISTS 施加，于是一封同时
+ *   进了两个账号收件箱的邮件会被**一起写**（红线 8 的原始语义，`test/write.test.ts` 的
+ *   「一键已读…跨账号副本一起写」锁的就是它）。列表侧的 `unseenClause` 反而刻意是
+ *   **副本级**账号范围（与逐账号角标同口径）——两处不同是需求不同，不是漏改。
+ */
+function unseenCopiesClause(
+  folders: FolderParam[] = DEFAULT_READ_SCOPE,
+): { sql: string; params: unknown[] } {
+  if (folders.length === 1 && !folders[0].account && isInboxFolder(folders[0].path)) {
+    return {
+      sql: `NOT (${HAS_SEEN_SQL}) AND upper(trim(c.folder)) = 'INBOX'`,
+      params: [],
+    };
+  }
+  const scopeC = folderClause(folders, "c");
+  const scopeCf = folderClause(folders, "cf");
+  return {
+    sql: `NOT (${HAS_SEEN_SQL}) AND ( ( upper(trim(c.folder)) = 'INBOX' AND EXISTS (SELECT 1 FROM copies cf WHERE cf.message_id = c.message_id AND ${scopeCf.sql}) ) OR ( ${scopeC.sql} AND NOT EXISTS (SELECT 1 FROM copies ci WHERE ci.message_id = c.message_id AND upper(trim(ci.folder)) = 'INBOX') ) )`,
+    params: [...scopeCf.params, ...scopeC.params],
+  };
+}
 
 /**
  * 「这封是正常邮件（至少有一份非垃圾副本）」——垃圾邮件不属于「邮件」（2026-10-10 第六轮）。
@@ -190,7 +274,8 @@ const UNSEEN_SQL = unseenSql([]);
  * **混在「全部」里、行上没有任何标记**，跟正常邮件长得一模一样，多出来的 5 封是什么完全看不出。
  *
  * 定稿（用户 2026-10-10 选「全站同一个数」方案）：
- * - **未读 = 收件箱未读**（见 UNSEEN_SQL）；
+ * - **未读 = 收件箱未读**（见 `unseenClause`；第九轮「垃圾也要有已读/未读」没有动这条：
+ *   垃圾箱里的未读**只**在「垃圾」tab 里被清点，不进任何未读数字）；
  * - **垃圾邮件不算「邮件」**：不进「全部」、不进搜索结果，只能在「垃圾」tab 里显式按文件夹
  *   查（那条路带 `folder` 参数，本排除**不生效**，否则垃圾 tab 会永远是空的）；
  * - 判定用**文件夹名**：`copies` 表只有路径这一个线索（special-use 要连 IMAP LIST，
@@ -209,6 +294,55 @@ function isJunkFolder(folder: string): boolean {
   return JUNK_NAMES_LOWER.includes(folder.trim().toLowerCase());
 }
 
+/**
+ * 副本是否在收件箱（路径大小写不敏感）。
+ * 已读/未读、`filter=unseen`、账号角标三处都以它为准（见 `readCopiesOf`）。
+ */
+function isInboxFolder(folder: string): boolean {
+  return folder.trim().toUpperCase() === "INBOX";
+}
+
+/** 副本是否落在给定的 `(账号, 路径)` 范围内（路径大小写不敏感；账号为空 = 不限账号） */
+function inFolderScope(c: CopyRow, folders: FolderParam[]): boolean {
+  return folders.some(
+    (f) =>
+      f.path.trim().toLowerCase() === c.folder.trim().toLowerCase() &&
+      (!f.account || f.account === c.account_id),
+  );
+}
+
+/**
+ * 「承载已读/未读状态的副本」——**已读态这一处唯一的判据**（2026-10-10 第九轮用户定稿：
+ * 「如果在协议层面，垃圾邮件也有已读/未读之分，那我们还是对齐协议吧」）。
+ *
+ * 协议上已读是**每份副本自己**的属性（IMAP 的 `\Seen` 属于某个文件夹里的某个 UID，
+ * 同一封信在收件箱与垃圾箱各有一份就可以各是一个状态）。但若照搬"每份副本各显示各的"，
+ * 同一封信就会在「收件」里粗、在「垃圾」里不粗，而详情页只能改其中一份——那正是用户
+ * 第七轮报过的「同一个状态存在多处、只更新一处」。故按**优先级**收敛成一封邮件一个已读态：
+ *
+ *  ① 有收件箱副本 → 只认收件箱副本（发件 / 归档 / 垃圾副本的 `\Seen` 不参与）；
+ *  ② 否则，本次查询显式给了文件夹范围（「垃圾」tab 传它探测到的垃圾文件夹）→ 认范围内的副本；
+ *  ③ 否则，详情页（`readFallbackJunk`）→ 认垃圾副本（这封信唯一可能承载已读状态的地方）；
+ *  ④ 都没有（发件 / 归档 / 自定义文件夹）→ **没有已读语义**：`seen` 恒为 true、不给动作。
+ *     「发件不可能有未读」是用户 2026-10-05 的定稿，第九轮没有扩大它。
+ *
+ * ⚠ `unseenClause`（SQL）/ `matchFilter`（搜索的 JS 路径）/ `applyFlags`（写回）必须与这里
+ *   **逐条同口径**——四处任何一处漂移，就会重现「加粗却筛不出来」或「改了界面不变」。
+ */
+function readCopiesOf(
+  copies: CopyRow[],
+  folders?: FolderParam[] | null,
+  readFallbackJunk = false,
+): CopyRow[] {
+  const inbox = copies.filter((c) => isInboxFolder(c.folder));
+  if (inbox.length) return inbox;
+  if (folders?.length) {
+    const scoped = copies.filter((c) => inFolderScope(c, folders));
+    if (scoped.length) return scoped;
+  }
+  return readFallbackJunk ? copies.filter((c) => isJunkFolder(c.folder)) : [];
+}
+
 /** 「至少一份非垃圾副本」；占位符与 `JUNK_NAMES_LOWER` 一一对应，绑参顺序必须与 where 拼接顺序一致 */
 const NOT_JUNK_ONLY_SQL = `EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND lower(trim(c.folder)) NOT IN (${JUNK_NAMES_LOWER.map(() => "?").join(", ")}))`;
 
@@ -225,9 +359,10 @@ export function parseLimit(raw: string | null | undefined): number {
 
 /**
  * 状态 / 方向筛选（4.2、4.9），两个维度互相独立、可组合：
- * - `filter`（状态）：逗号分隔多值（2026-10-04 起）——`unseen` = **存在无 `\Seen` 的 INBOX
- *   副本**（收件箱未读，2026-10-10 第六轮改，见 `unseenSql`；旧口径「任一副本无 `\Seen`」
- *   会把垃圾箱里的未读也算进来），且**给了 `account` 时限定在该账号内**（与账号角标同口径）；
+ * - `filter`（状态）：逗号分隔多值（2026-10-04 起）——`unseen` = 存在一份**未读的、承载
+ *   已读状态的副本**（判据见 `readCopiesOf` / `unseenClause`）：不给 `folder` 时就是
+ *   「收件箱未读」；给了 `folder`（「垃圾」tab）时是「收件箱优先、否则该范围内的副本」，
+ *   即垃圾箱里的未读**只在这个 tab 里**被清点，不进任何未读数字；
  *   `flagged` = 存在任一副本有 `\Flagged`。多值取交集（`unseen,flagged` = 未读且加星，
  *   前端「星标」视图 + 「未读」开关需要这种组合）；单值写法不变。
  * - `direction`（方向）：`received` = 存在 INBOX 副本（收到的）；`sent` = 副本**全部**在
@@ -238,7 +373,7 @@ export function parseLimit(raw: string | null | undefined): number {
  * ⚠ `sent` 的口径必须与前端 `isSentItem`（`lib/mail/kind.ts`）完全一致，
  * 否则会出现「筛出来不对」的矛盾；两边共用同一份文件夹名名单（各持一份，改动同步）。
  * ⚠ 本函数的 JS 路径（搜索）与 `listMessages` 的 SQL 路径必须**逐条同口径**：
- *   草稿 → `NOT_DRAFT_SQL` / 垃圾 → `NOT_JUNK_ONLY_SQL` / 未读 → `unseenSql`。
+ *   草稿 → `NOT_DRAFT_SQL` / 垃圾 → `NOT_JUNK_ONLY_SQL` / 未读 → `unseenClause`。
  */
 function matchFilter(
   ctx: WebmailContext,
@@ -246,7 +381,7 @@ function matchFilter(
   filter: string | null,
   direction: string | null,
   folder?: FolderParam[] | null,
-  /** 账号范围（空 = 不限）：未读判定要跟着它收窄，见 `unseenSql` */
+  /** 账号范围（空 = 不限）：未读判定要跟着它收窄，见 `unseenClause` */
   accountIds: string[] = [],
 ): boolean {
   const copies = copiesOf(ctx, messageId);
@@ -256,21 +391,15 @@ function matchFilter(
   if (!folder?.length && !copies.some((c) => !isJunkFolder(c.folder))) return false;
   const filters = new Set((filter ?? "").split(",").filter(Boolean));
   if (!filters.size && !direction && !folder) return true;
-  // 未读 = 收件箱未读（`unseenSql` 的 JS 版）：垃圾/发件/归档里的未读副本不算，
-  // 且给了账号范围时只认该账号的 INBOX 副本（与账号角标逐账号同口径）
-  if (
-    filters.has("unseen") &&
-    !copies.some(
-      (c) =>
-        (!accountIds.length || accountIds.includes(c.account_id)) &&
-        c.folder.trim().toUpperCase() === "INBOX" &&
-        !c.flags.split(" ").includes("\\Seen"),
-    )
-  ) {
-    return false;
+  // 未读 = `unseenClause`（SQL）的 JS 版，判据见 readCopiesOf：账号范围内先认收件箱副本，
+  // 没有收件箱副本才看本次查询的文件夹范围（「垃圾」tab 的就地筛选），两者都没有 = 不可能未读
+  if (filters.has("unseen")) {
+    const inScope = copies.filter((c) => !accountIds.length || accountIds.includes(c.account_id));
+    const unread = readCopiesOf(inScope, folder).some((c) => !c.flags.split(" ").includes("\\Seen"));
+    if (!unread) return false;
   }
   if (filters.has("flagged") && !copies.some((c) => c.flags.split(" ").includes("\\Flagged"))) return false;
-  if (direction === "received" && !copies.some((c) => c.folder.trim().toUpperCase() === "INBOX")) return false;
+  if (direction === "received" && !copies.some((c) => isInboxFolder(c.folder))) return false;
   if (direction === "sent" && !(copies.length > 0 && copies.every((c) => isSentFolderName(c.folder)))) return false;
   if (folder?.length) {
     if (
@@ -318,6 +447,25 @@ export function parseFolderParams(rawValues: (string | null)[]): FolderParam[] {
 }
 
 /**
+ * 文件夹范围 → SQL 片段（`(账号 = ? AND 路径 = ?) OR (路径 = ?) …`，取并集），
+ * 返回片段与占位符参数：**每个子句先推账号（若有）、再推路径**，与片段里的先后一致。
+ * 列表的 `folder` 筛选、`unseenClause`、`unseenCopiesClause` 三处共用，故抽到这里——
+ * 同一份"范围内"的定义只写一次。
+ */
+function folderClause(folders: FolderParam[], alias: string): { sql: string; params: unknown[] } {
+  const params: unknown[] = [];
+  const clauses = folders.map((f) => {
+    if (f.account) {
+      params.push(f.account, f.path);
+      return `(${alias}.account_id = ? AND lower(trim(${alias}.folder)) = lower(trim(?)))`;
+    }
+    params.push(f.path);
+    return `lower(trim(${alias}.folder)) = lower(trim(?))`;
+  });
+  return { sql: `(${clauses.join(" OR ")})`, params };
+}
+
+/**
  * 合并视图：跨账号按时间倒序，游标（date, messageId）分页。
  * `account` 支持逗号分隔多值（2026-10-05 起，多选账号筛选取**并集**；单值写法不变）。
  */
@@ -345,7 +493,7 @@ function listMessages(ctx: WebmailContext, url: URL) {
           copiesOf(ctx, r.message_id).some((c) => accountIds.includes(c.account_id)),
       )
       .filter((r) => matchFilter(ctx, r.message_id, filter, direction, folder, accountIds))
-      .map((r) => listItem(ctx, r, names));
+      .map((r) => listItem(ctx, r, names, folder));
     return { items, next: null };
   }
 
@@ -364,9 +512,11 @@ function listMessages(ctx: WebmailContext, url: URL) {
   // filter 支持逗号分隔多值（交集语义，与 matchFilter 的 JS 路径同口径）
   const filters = new Set((filter ?? "").split(",").filter(Boolean));
   if (filters.has("unseen")) {
-    where += ` AND ${unseenSql(accountIds)}`;
-    // ⚠ 限定账号时该子句才有占位符；无账号时 push 空数组是无操作（顺序也天然对齐）
-    params.push(...accountIds);
+    // 未读的判据（含「垃圾」tab 收件箱优先、否则垃圾）见 unseenClause；
+    // 不给 folder 时它退化成收件箱未读（占位符只有账号那一组，与旧实现一致）
+    const unseen = unseenClause(accountIds, folder?.length ? folder : undefined);
+    where += ` AND ${unseen.sql}`;
+    params.push(...unseen.params);
   }
   if (filters.has("flagged")) {
     where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND ${HAS_FLAGGED_SQL})`;
@@ -392,17 +542,9 @@ function listMessages(ctx: WebmailContext, url: URL) {
   // 与 matchFilter 的 JS 路径同口径）；给了账号则再限定在该账号内。
   // 2026-10-08：可给多个 folder 参数（并集），「垃圾」tab 用它一次筛出各账号的垃圾文件夹
   if (folder?.length) {
-    const clauses: string[] = [];
-    for (const f of folder) {
-      if (f.account) {
-        clauses.push("(c.account_id = ? AND lower(trim(c.folder)) = lower(trim(?)))");
-        params.push(f.account, f.path);
-      } else {
-        clauses.push("lower(trim(c.folder)) = lower(trim(?))");
-        params.push(f.path);
-      }
-    }
-    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND (${clauses.join(" OR ")}))`;
+    const scope = folderClause(folder, "c");
+    where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND ${scope.sql})`;
+    params.push(...scope.params);
   }
   const rows = ctx.db
     .prepare(`SELECT m.* FROM messages m WHERE ${where} ORDER BY m.date DESC, m.message_id DESC LIMIT ?`)
@@ -410,7 +552,9 @@ function listMessages(ctx: WebmailContext, url: URL) {
   const page = rows.slice(0, limit);
   const last = page.at(-1);
   const next = rows.length > limit && last?.date ? `${last.date}|${last.message_id}` : null;
-  return { items: page.map((r) => listItem(ctx, r, names)), next };
+  // ⚠ readFolders 必须传：给了 folder 的视图（「垃圾」tab）里，行的已读态要跟着那个范围走，
+  //   否则行显示"已读"、`filter=unseen` 却把它筛出来（同一个判据两处写法就会这样）
+  return { items: page.map((r) => listItem(ctx, r, names, folder)), next };
 }
 
 /** 附件清单（精简原文才有；NULL = 原文完整，按整封解析） */
@@ -432,7 +576,9 @@ async function messageDetail(ctx: WebmailContext, messageId: string) {
   const row = messageOf(ctx, messageId);
   if (!row) return null;
   const base = {
-    ...listItem(ctx, row, contactNameMap(ctx.db)),
+    // 详情页没有视图上下文：已读态按「收件箱优先、否则垃圾」兜底（见 readCopiesOf ③）——
+    // 垃圾邮件在站内打开时必须能标已读/未读，且与「垃圾」tab 里那一行同判据
+    ...listItem(ctx, row, contactNameMap(ctx.db), null, true),
     cc: JSON.parse(row.cc_json),
     // 引用链（4.7）：回复时带上，自己发出的信才能继续挂进会话
     refs: JSON.parse(row.refs_json ?? "[]") as string[],
@@ -553,10 +699,21 @@ async function attachmentContent(
   };
 }
 
-/** 标记写回：对该 Message-ID 的所有副本一起写（红线 8），再更新本地索引 */
+/**
+ * 标记写回：对该 Message-ID 的可写副本一起写（红线 8），再更新本地索引。
+ *
+ * ⚠ **`seen` 只写「承载已读状态的副本」**（判据 `readCopiesOf`，收件箱优先、没有收件箱
+ * 副本时才认垃圾副本）：写一份界面上根本没有已读概念的副本（发件 / 归档）等于白写，
+ * 还会把别处的状态莫名改掉；反过来，垃圾邮件在「垃圾」tab 里显示为未读时**必须**能写它
+ * ——否则就是"点了没反应"（第九轮用户要求垃圾也对齐协议）。一份都没有时直接返回
+ * `{updated: 0}`（一次 IMAP 都不连）。
+ * 「星标」不受此限——星标是用户自己的标记，垃圾邮件也能加星。
+ */
 async function applyFlags(ctx: WebmailContext, messageId: string, change: FlagChange) {
-  const copies = copiesOf(ctx, messageId);
-  if (copies.length === 0) throw new Error(`消息不存在：${messageId}`);
+  const all = copiesOf(ctx, messageId);
+  if (all.length === 0) throw new Error(`消息不存在：${messageId}`);
+  const copies = change.seen === undefined ? all : readCopiesOf(all, null, true);
+  if (copies.length === 0) return { updated: 0 };
   const byAccount = new Map<string, CopyRow[]>();
   for (const c of copies) {
     const list = byAccount.get(c.account_id) ?? [];
@@ -606,7 +763,11 @@ async function applyFlagsBatch(
 }> {
   const rows: (CopyRow & { message_id: string })[] = [];
   for (const id of messageIds) {
-    for (const c of copiesOf(ctx, id)) rows.push({ ...c, message_id: id });
+    const copies = copiesOf(ctx, id);
+    // ⚠ 同 applyFlags：`seen` 只写「承载已读状态的副本」（收件箱优先、否则垃圾），
+    //   星标写全部副本
+    const targets = change.seen === undefined ? copies : readCopiesOf(copies, null, true);
+    for (const c of targets) rows.push({ ...c, message_id: id });
   }
   const result = {
     updated: 0,
@@ -664,15 +825,16 @@ async function applyFlagsBatch(
 }
 
 /**
- * 批量标已读（2026-10-05，供 /mail 的「全部标为已读」）：
- * 把**范围内可见的未读消息**的每个缺 \Seen 副本补上 \Seen（含范围外账号的副本，
- * 与单条 `applyFlags` 的「所有副本一起写」同一条红线 8）。
+ * 批量标已读（2026-10-05，供 /mail 的「全部标为已读」）：把这个范围内**显示为未读**的副本
+ * 补上 `\Seen`，按账号分组、账号内按文件夹分组，每文件夹一次 STORE。
  *
- * ⚠ 口径说明（2026-10-10 第六轮）：本动作的范围是**所有文件夹**里缺 \Seen 的副本
- * （含垃圾 / 归档），而**「未读」这个筛选只认收件箱**（`UNSEEN_SQL`）——即本动作是显示口径
- * 的**超集**。这是有意的：按钮的可用性由收件箱未读数决定（`unreadTotal`），点它就是把
- * 未读清干净（服务商侧的垃圾未读也一并清掉，不影响本站任何显示）。若将来要收窄成
- * 「只清收件箱」，在这里加 `AND upper(trim(c.folder)) = 'INBOX'` 即可。
+ * ⚠ 口径（2026-10-10 第九轮，与「未读」判据 `readCopiesOf` / `unseenCopiesClause` 同源）：
+ * - **不给 `folders`**（收件 / 全部 / 发件 / 搜索）→ 只清**收件箱**副本：与账号角标 /
+ *   大标题角标 / 底栏统计完全同口径（第七轮定稿，未改）；
+ * - **给了 `folders`**（「垃圾」tab 把自己探测到的垃圾文件夹发过来，用户第九轮定稿
+ *   「跟着 tab 走」）→ 只动**在这些文件夹里有副本**的邮件：其收件箱副本（收件箱优先）、
+ *   或没有收件箱副本时其范围内的副本。⚠ 少了「这封在范围内」这道限，垃圾 tab 里点
+ *   「全部标为已读」会把整个收件箱清掉。
  *
  * 范围 = `accountIds`（空 = 全部账号）：只计入「至少有一个副本落在这些账号里」的消息。
  * 方向 / 搜索 / 星标不参与——「全部已读」按账号范围清最为直觉。
@@ -680,18 +842,17 @@ async function applyFlagsBatch(
  * 性能：所选副本按账号分组、账号内再按文件夹分组，**每文件夹一次 STORE**（见 setSeenBatch），
  * 每账号一次连接。单账号失败只记 skipped，不阻断其它账号（与批量写操作的整体风格一致）。
  */
-async function markAllRead(ctx: WebmailContext, accountIds: string[]) {
-  const params: unknown[] = [];
+async function markAllRead(ctx: WebmailContext, accountIds: string[], folders?: string[]) {
+  const readScope = parseFolderParams(folders ?? []);
+  const unseen = unseenCopiesClause(readScope.length ? readScope : undefined);
+  const params: unknown[] = [...unseen.params];
   let scope = "";
   if (accountIds.length) {
     scope = ` AND EXISTS (SELECT 1 FROM copies cs WHERE cs.message_id = c.message_id AND cs.account_id IN (${accountIds.map(() => "?").join(", ")}))`;
     params.push(...accountIds);
   }
   const rows = ctx.db
-    .prepare(
-      `SELECT c.account_id, c.folder, c.uid, c.message_id FROM copies c
-       WHERE instr(' ' || c.flags || ' ', ' \\Seen ') = 0${scope}`,
-    )
+    .prepare(`SELECT c.account_id, c.folder, c.uid, c.message_id FROM copies c WHERE ${unseen.sql}${scope}`)
     .all(...params) as { account_id: string; folder: string; uid: number; message_id: string }[];
 
   const result: { updated: number; messages: number; skipped: { account: string; folder: string; uid: number; reason: string }[] } = {
@@ -1191,11 +1352,17 @@ export function createApiServer(ctx: WebmailContext): Server {
       }
 
       if (req.method === "POST" && path === "/mark-all-read") {
-        const body = (await readBody(req)) as { accounts?: unknown };
+        const body = (await readBody(req)) as { accounts?: unknown; folders?: unknown };
         const accounts = Array.isArray(body.accounts)
           ? body.accounts.filter((a): a is string => typeof a === "string" && a.length > 0)
           : [];
-        return json(res, 200, await markAllRead(ctx, accounts));
+        // folders（2026-10-10 第九轮）：与列表查询同一个 `账号|路径` 写法，
+        // 「垃圾」tab 传来它当前在看的垃圾文件夹 → 只清这些范围内的未读；
+        // 不给 = 只清收件箱（收件 / 全部 / 发件 / 搜索那条路，行为与第六轮一致）
+        const folders = Array.isArray(body.folders)
+          ? body.folders.filter((f): f is string => typeof f === "string" && f.length > 0)
+          : [];
+        return json(res, 200, await markAllRead(ctx, accounts, folders));
       }
 
       if (req.method === "POST" && (path === "/move" || path === "/delete")) {
