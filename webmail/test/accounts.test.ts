@@ -143,7 +143,8 @@ describe("账号管理：输入校验（normalizeAccountInput）", () => {
       "#123456"
     );
     expect(normalizeAccountInput(base, new Set()).account.color).toBe("cyan");
-    // 第 2 个账号拿到的是色板里离 cyan 最远的那个（ΔE 31.1），不是紧邻的 violet
+    // 第 2 个账号拿的是色板里排在 cyan 后面那一格（顺序 = 观感序，不是紧邻色；
+    // 统一明度/彩度后任意两色的 OKLab ΔE 都 ≥0.95×2C，顺序影响 <1%——见 MAIL-AGENT.md 4.2）
     expect(normalizeAccountInput(base, new Set(), ["cyan"]).account.color).toBe("pink");
     expect(normalizeAccountInput(base, new Set(), ["cyan", "pink"]).account.color).toBe("violet");
     expect(normalizeAccountInput(base, new Set(), ["cyan", "violet"]).account.color).toBe("pink");
