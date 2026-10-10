@@ -7,7 +7,7 @@ import { connectAccount } from "../../mail/src/imap.js";
 import { headerValue, INTERNAL_KEY_HEADER, internalKeyMatches } from "../../mail/src/internal-key.js";
 import { backfillProgress, hasPendingBackfill, syncAccount, type SyncOptions } from "../../mail/src/fetcher.js";
 import { searchMessages } from "../../mail/src/search.js";
-import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
+import { normalizeMessageId, pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
 import { threadMessageIds, threadRootKeys } from "../../mail/src/thread.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import type { CopyRef, FlagChange, SendInput, WebmailAccount } from "./types.js";
@@ -1019,15 +1019,21 @@ async function applyCopiesOp(
  * 下一轮同步才知道新 UID——撤销窗口只有几秒，等不起。所以在这里**现场定位**：
  * 打开垃圾夹、`UID SEARCH HEADER Message-ID` 找到那一封，再搬回目标文件夹。
  *
- * 目标有两种来源（`target.folder`）：
- * - **给了**：撤销场景——前端手里有「搬走前那份 copies」，原文件夹是确定的；
- * - **不给**：默认 `INBOX`。「垃圾」tab 的行内「移出垃圾」（2026-10-10）走这条——
- *   那里前端**只知道**副本位置就是垃圾夹本身（它是搬来之后的态），原文件夹无从得知。
- *   `INBOX` 是 RFC 3501 保证存在且大小写不敏感的收件箱名。
+ * 目标由 `target.folder` 给出；不给时缺省 `INBOX`（RFC 3501 保证存在且大小写不敏感）。
+ * ⚠ 目前唯一的调用方（撤销「标为垃圾」）**总是给**：「垃圾」tab 的「移出垃圾」已改走
+ *   普通的 `POST /move`——那里前端手里就是**当前**垃圾夹里那份副本，uid 有效，
+ *   没必要做这个现场定位。
  *
- * ⚠ 匹配值用库键里的 normalized Message-ID（去尖括号、小写）：IMAP 的 SEARCH 是
- *   子串 + 大小写不敏感，规范化后的串正是原始头值的子串，故能命中。
- *   没有 Message-ID 的邮件（库键 `auto:` 前缀）**无法定位**，如实记 skipped——不猜。
+ * ⚠ **不能用 `SEARCH HEADER Message-ID`**（2026-10-10 真实账号实测的路）：阿里云与 QQ
+ *   两家个人邮箱的 IMAP 对它**一律返回空集且不报错**——裸值 / 带尖括号 / 只取 local part
+ *   三种形式全试过，两家全部 `[]`，而同一封邮件的 `Message-Id:` 头明明就在那里
+ *   （同一个连接 FETCH 得到）。于是「撤销」在真实邮箱上永远报「找不到这封邮件」。
+ *   改为**拉整个垃圾夹的 Message-ID 头、本地比对**：只取一个头字段（实测每封约
+ *   100 字节），个人邮箱的垃圾夹规模下几秒内跑完；撤销本来就是低频操作。
+ *
+ * ⚠ 匹配值用库键里的 normalized Message-ID（去尖括号、小写，与 `normalizeMessageId`
+ *   同一套）——服务端头的写法不一（实测有 `Message-ID:` 也有 `Message-Id:`，值也有大小写），
+ *   两边都过一遍同一个归一化函数才比得准。
  * ⚠ 本地索引只删「垃圾夹里那一行」（若已同步到）。**不 prune**：信仍在原文件夹里，
  *   下一轮同步会在那儿重建副本行；prune 会把 messages 行与原文文件一并清掉，
  *   于是刚恢复的邮件在本地变成没正文的空壳。
@@ -1061,14 +1067,24 @@ async function undoJunkMove(
           return;
         }
         await openReadWrite(client, junk);
-        const found = await client.search({ header: { "Message-ID": bare } }, { uid: true });
-        const uids = Array.isArray(found) ? found : [];
-        if (uids.length === 0) {
+        const box = client.mailbox;
+        if (box === false || box.exists === 0) {
+          skipped.push({ accountId: target.accountId, reason: "垃圾邮件文件夹是空的" });
+          return;
+        }
+        // 拉整个垃圾夹的 Message-ID 头，本地比对（为什么不用 SEARCH 见函数头注释）
+        const wanted: number[] = [];
+        for await (const msg of client.fetch("1:*", { headers: ["message-id"] }, { uid: true })) {
+          const raw = msg.headers ? Buffer.from(msg.headers).toString("utf8") : "";
+          const got = normalizeMessageId(/^message-id:\s*(.*)$/im.exec(raw)?.[1]);
+          if (got !== null && got === bare) wanted.push(msg.uid);
+        }
+        if (wanted.length === 0) {
           skipped.push({ accountId: target.accountId, reason: "在垃圾邮件文件夹里找不到这封邮件" });
           return;
         }
         // 多个命中（同一封信重复进垃圾夹）时取最新的那个
-        const uid = Math.max(...uids);
+        const uid = Math.max(...wanted);
         await moveUid(client, junk, uid, target.folder || "INBOX");
         ctx.db
           .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
