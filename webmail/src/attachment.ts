@@ -73,11 +73,22 @@ export function isInlineSafe(contentType?: string | null): boolean {
   return base !== null && INLINE_SAFE_TYPES.has(base);
 }
 
-/** ASCII 回退文件名：剥控制字符（含 CR/LF）与引号、反斜杠；空则用 attachment */
+/**
+ * `filename="…"`（ASCII 回退位）里的文件名。
+ *
+ * ⚠ **必须真的只剩可打印 ASCII**（`U+0020`–`U+007E`）：Node 的 http 模块对 header 值
+ *   只接受 Latin-1，含全角字符会直接抛 `ERR_INVALID_CHAR`——响应发不出去，附件下载
+ *   变成 **500**。真机实测踩到（2026-10-10）：QQ 邮箱那封「2026－2027年度…军（警）官
+ *   招录计划.xlsx」，`－` `（` `）` 全是 U+FF0x，落在 Latin-1 之外。
+ *   此前只剥了控制字符与引号，看着像"ASCII 回退"其实不是。
+ * ⚠ 真名不靠这一位承载：`filename*=UTF-8''…` 走 `encodeURIComponent`（所以不受影响），
+ *   各客户端优先用它。这里只需保证**合法且可读**。
+ */
 export function asciiFilename(filename?: string | null): string {
   const cleaned = (filename ?? "")
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f"\\]/g, "")
+    .replace(/[^\u0020-\u007e]/g, "_")
     .trim();
   return cleaned.length > 0 ? cleaned : "attachment";
 }

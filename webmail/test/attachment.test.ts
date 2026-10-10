@@ -131,4 +131,37 @@ describe("附件响应头（安全加固）", () => {
     expect(asciiFilename('a"b\\c\u0000d')).toBe("abcd");
     expect(asciiFilename("   ")).toBe("attachment");
   });
+
+  /**
+   * ⚠ 全角字符必须被换掉（2026-10-10 真机踩到）：Node 的 http 模块对 header 值只接受
+   * Latin-1，`filename="…"` 里含 U+FF0x 会抛 ERR_INVALID_CHAR → 附件下载变 500。
+   * 真名由 `filename*=UTF-8''…` 承载，这里只求合法。
+   */
+  it("asciiFilename 把非 Latin-1 字符换成下划线（否则 Node 设 header 会抛 ERR_INVALID_CHAR）", () => {
+    const ascii = asciiFilename("2026－2027年度直接选拔招录军（警）官招录计划.xlsx");
+    // 逐个字符都在可打印 ASCII 范围内（这就是「不会再抛 ERR_INVALID_CHAR」的判据）；
+    // 不锁具体下划线个数——那是排版细节，锁住它只会让用例在改名时无谓地红
+    expect([...ascii].every((c) => c >= " " && c <= "~")).toBe(true);
+    expect(ascii).toContain("2026");
+    expect(ascii.endsWith(".xlsx")).toBe(true);
+    // 端到端：真的拿去构造 header 时不抛（这一条才是这次 bug 的回归点）
+    expect(() =>
+      resolveAttachmentHeaders({
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename: "2026－2027年度直接选拔招录军（警）官招录计划.xlsx",
+        inline: false,
+      }),
+    ).not.toThrow();
+    const headers = resolveAttachmentHeaders({
+      contentType: "application/pdf",
+      filename: "余绍缘－报告（终稿）.pdf",
+      inline: false,
+    });
+    expect([...headers.contentDisposition].every((c) => c >= " " && c <= "~")).toBe(true);
+    // ⚠ 真名不能被丢掉：它由 `filename*=UTF-8''…` 承载（encodeURIComponent，本就编码了）
+    expect(headers.contentDisposition).toContain("filename*=UTF-8''");
+    expect(decodeURIComponent(headers.contentDisposition.split("filename*=UTF-8''")[1])).toBe(
+      "余绍缘－报告（终稿）.pdf",
+    );
+  });
 });
