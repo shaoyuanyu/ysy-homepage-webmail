@@ -32,6 +32,7 @@ import { deleteServerDraftCopy, readDraftServerRef } from "./draft-mirror.js";
 import { readDraft, refreshDraftBox } from "./draft-store.js";
 import { createDraft, deleteDraft, findDrafts, listDrafts, updateDraft, type DraftInput } from "./drafts.js";
 import { withAccountLock } from "./locks.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 import { renderMailHtml } from "./render.js";
 import { sendMessage } from "./send.js";
 import { applyFlagChange, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, openReadWrite, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
@@ -750,13 +751,13 @@ async function applyFlags(ctx: WebmailContext, messageId: string, change: FlagCh
     const cred = ctx.credentials.get(accountId);
     if (!account || !cred) throw new Error(`账号未配置：${accountId}`);
     await withAccountLock(accountId, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(accountId, () => connectAccount(account, cred));
       try {
         for (const c of rows) {
           await setFlags(client, c.folder, c.uid, change);
         }
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
     // 服务端写成功后更新本地索引（口径见 write.ts 的 applyFlagChange，与红线 2 对应）
@@ -817,7 +818,7 @@ async function applyFlagsBatch(
       continue;
     }
     await withAccountLock(accountId, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(accountId, () => connectAccount(account, cred));
       try {
         const byFolder = new Map<string, (CopyRow & { message_id: string })[]>();
         for (const r of list) {
@@ -842,7 +843,7 @@ async function applyFlagsBatch(
           }
         }
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
   }
@@ -901,7 +902,7 @@ async function markAllRead(ctx: WebmailContext, accountIds: string[], folders?: 
       continue;
     }
     await withAccountLock(accountId, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(accountId, () => connectAccount(account, cred));
       try {
         const byFolder = new Map<string, number[]>();
         for (const r of list) {
@@ -927,7 +928,7 @@ async function markAllRead(ctx: WebmailContext, accountIds: string[], folders?: 
           }
         }
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
   }
@@ -957,7 +958,7 @@ async function applyCopiesOp(
     /** 本账号**真正动过**的副本——只有它们才清本地索引（被跳过的账号一行都不能清） */
     const handled: CopyRef[] = [];
     await withAccountLock(accountId, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(accountId, () => connectAccount(account, cred));
       try {
         let target: string | null = null;
         if (op === "move") {
@@ -984,7 +985,7 @@ async function applyCopiesOp(
           affected++;
         }
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
     // 源位置的副本行删除；目标文件夹由下一轮同步发现。
@@ -1059,7 +1060,7 @@ async function undoJunkMove(
       continue;
     }
     await withAccountLock(target.accountId, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(target.accountId, () => connectAccount(account, cred));
       try {
         const junk = await resolveMoveTarget(client, "\\Junk");
         if (!junk) {
@@ -1091,7 +1092,7 @@ async function undoJunkMove(
           .run(target.accountId, junk, uid);
         restored++;
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
   }
