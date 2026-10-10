@@ -12,6 +12,7 @@ import {
   listMetaRange,
   listNewMeta,
   openReadOnly,
+  openedSpecialUse,
   partSignature,
   type EnvelopeInfo,
   type NewMeta,
@@ -406,6 +407,7 @@ function saveFolder(
   db: Db,
   accountId: string,
   folder: string,
+  specialUse: string,
   uidValidity: number,
   lastSeenUid: number,
   backfillUid: number | null,
@@ -414,19 +416,21 @@ function saveFolder(
   touchFlags: boolean
 ): void {
   db.prepare(
-    `INSERT INTO folders (account_id, path, uidvalidity, last_seen_uid, last_flags_sync,
+    `INSERT INTO folders (account_id, path, special_use, uidvalidity, last_seen_uid, last_flags_sync,
                           backfill_uid, backfill_total, backfill_remaining)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (account_id, path) DO UPDATE SET
        uidvalidity = excluded.uidvalidity,
        last_seen_uid = excluded.last_seen_uid,
        last_flags_sync = CASE WHEN ? THEN excluded.last_flags_sync ELSE folders.last_flags_sync END,
        backfill_uid = excluded.backfill_uid,
        backfill_total = excluded.backfill_total,
-       backfill_remaining = excluded.backfill_remaining`
+       backfill_remaining = excluded.backfill_remaining,
+       special_use = CASE WHEN excluded.special_use <> '' THEN excluded.special_use ELSE folders.special_use END`
   ).run(
     accountId,
     folder,
+    specialUse,
     uidValidity,
     lastSeenUid,
     new Date().toISOString(),
@@ -497,6 +501,9 @@ export async function syncFolder(
 ): Promise<SyncResult> {
   const mode = opts.mode ?? "full";
   const uidValidity = await openReadOnly(client, folder);
+  // RFC 6154 特殊用途（服务端标志位，认不出时 imapflow 按本地化名字推断）：
+  // 写入数据库后，列表响应据此判定「这封是不是我发出的」，前端不再按文件夹名字猜
+  const specialUse = openedSpecialUse(client);
   const state = db
     .prepare(
       `SELECT uidvalidity, last_seen_uid, last_flags_sync, backfill_uid, backfill_total,
@@ -564,7 +571,7 @@ export async function syncFolder(
       // 而这正是最需要显示进度的时刻。顺带把水位线也钉住了：这一块中途崩掉/被部署打断，
       // 重启后不会重头再来。
       saveFolder(
-        db, account.id, folder, uidValidity, lastSeenUid,
+        db, account.id, folder, specialUse, uidValidity, lastSeenUid,
         backfillUid, backfillTotal, backfillRemaining, false
       );
     }
@@ -588,7 +595,7 @@ export async function syncFolder(
       const top = fresh[done.length - 1]?.uid ?? lastSeenUid;
       if (top > lastSeenUid) lastSeenUid = top;
       saveFolder(
-        db, account.id, folder, uidValidity, lastSeenUid,
+        db, account.id, folder, specialUse, uidValidity, lastSeenUid,
         backfillUid, backfillTotal, backfillRemaining, false
       );
     }
@@ -632,7 +639,7 @@ export async function syncFolder(
   }
 
   saveFolder(
-    db, account.id, folder, uidValidity, lastSeenUid,
+    db, account.id, folder, specialUse, uidValidity, lastSeenUid,
     backfillUid, backfillTotal, backfillRemaining,
     // ⚠ 只有真的读了才刷新 last_flags_sync：跳过却盖时间戳，下一轮就会以为「刚读过」
     //   而继续跳过（10 分钟的窗口永远打不开）

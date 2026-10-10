@@ -39,6 +39,10 @@ function migrate(db: Db): void {
     CREATE TABLE IF NOT EXISTS folders (
       account_id TEXT NOT NULL,
       path TEXT NOT NULL,
+      -- RFC 6154 特殊用途（\\Sent / \\Junk / \\Archive …）：同步打开文件夹时
+      -- 从 imapflow 的 mailbox 状态记下（见 fetcher.ts 的 saveFolder）。列表响应据此
+      -- 判定「这封是不是我发出的」，前端不再按文件夹名字猜（名字各服务商不同）。
+      special_use TEXT NOT NULL DEFAULT '',
       uidvalidity INTEGER,
       last_seen_uid INTEGER NOT NULL DEFAULT 0,
       last_flags_sync TEXT,
@@ -195,6 +199,8 @@ function migrate(db: Db): void {
     "backfill_remaining",
     "backfill_remaining INTEGER NOT NULL DEFAULT 0"
   );
+  // 文件夹特殊用途（2026-10-10）：见 CREATE TABLE folders 的注记
+  addColumnIfMissing(db, "folders", "special_use", "special_use TEXT NOT NULL DEFAULT ''");
 }
 
 /**

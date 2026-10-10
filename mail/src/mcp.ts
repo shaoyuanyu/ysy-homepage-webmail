@@ -14,10 +14,13 @@ import {
   agentTimeline,
   AgentViewError,
 } from "./agentview.js";
+import { headerValue, INTERNAL_KEY_HEADER, internalKeyMatches } from "./internal-key.js";
 
 /**
  * 工具面 HTTP 服务（5.3）：MCP over streamable HTTP + 给前端/人工的 JSON 端点。
- * 默认绑 127.0.0.1（MAIL_AGENT_HOST 可调）、不做认证（与 webmaild 同一信任边界）。
+ * 默认绑 127.0.0.1（MAIL_AGENT_HOST 可调）。绑非回环地址时必须配 MAIL_AGENT_INTERNAL_KEY
+ * （站点代理注入 `x-internal-key`，见 mail/src/internal-key.ts）：这个面只有站点代理该访问，
+ * 而它包含 `send_as_agent` 与待确认队列的操作端点。
  * - POST /mcp                          MCP 工具面（无状态，每请求一个 transport）
  * - GET  /health                       存活
  * - GET  /ledger?limit=&beforeId=      台账只读视图（前端台账页签用）
@@ -56,9 +59,18 @@ function buildMcpServer(ctx: ToolsContext): McpServer {
   return server;
 }
 
-export function createToolsServer(ctx: ToolsContext): Server {
+export function createToolsServer(
+  ctx: ToolsContext,
+  opts?: { internalKey?: string }
+): Server {
   return createServer(async (req, res) => {
     try {
+      if (
+        opts?.internalKey &&
+        !internalKeyMatches(headerValue(req.headers, INTERNAL_KEY_HEADER), opts.internalKey)
+      ) {
+        return sendJson(res, 401, { error: "unauthorized" });
+      }
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
       if (req.method === "POST" && url.pathname === "/mcp") {

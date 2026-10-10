@@ -4,6 +4,7 @@ import { openDb } from "./db.js";
 import { hasPendingBackfill, syncAccount } from "./fetcher.js";
 import { markSyncOk } from "./health.js";
 import { watchAccount } from "./idle.js";
+import { isLoopbackHost } from "./internal-key.js";
 import { agentDbPath, openAgentDb, type AgentDb } from "./ledger.js";
 import { createToolsServer, TOOLS_PORT } from "./mcp.js";
 import { backfillRefs } from "./message.js";
@@ -18,6 +19,11 @@ const once = process.argv.includes("--once");
 
 /** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 MAIL_AGENT_HOST 覆盖（如 0.0.0.0） */
 const HOST = process.env.MAIL_AGENT_HOST ?? "127.0.0.1";
+/**
+ * 工具面的内部密钥（站点代理注入 `x-internal-key`）。绑非回环地址时必填：
+ * 工具面包含 `send_as_agent` 与待确认队列的确认/丢弃端点，不能只靠网络隔离。
+ */
+const INTERNAL_KEY = process.env.MAIL_AGENT_INTERNAL_KEY ?? "";
 /** worker 自连工具面的目标：监听 0.0.0.0 时回落回环（0.0.0.0 不是可连接的目标地址） */
 const SELF_HOST = HOST === "0.0.0.0" ? "127.0.0.1" : HOST;
 
@@ -53,6 +59,7 @@ function buildPool(
   return new WorkerPool({
     agentDb: adb,
     mcpUrl: `http://${SELF_HOST}:${TOOLS_PORT}/mcp`,
+    internalKey: INTERNAL_KEY,
     model: createModel(cfg),
     modelName: cfg.model,
     reportTo,
@@ -125,8 +132,18 @@ for (const account of accounts) {
 }
 
 if (!once) {
+  if (!isLoopbackHost(HOST) && !INTERNAL_KEY) {
+    throw new Error(
+      `MAIL_AGENT_HOST=${HOST} 绑定的不是回环地址，但 MAIL_AGENT_INTERNAL_KEY 为空——` +
+        "任何能连上该端口的人都能使用工具面（含 send_as_agent 与待确认队列）。" +
+        "请在 mailagentd 与站点两侧同时配置同一个密钥。"
+    );
+  }
   console.log("进入 IDLE 监听（Ctrl-C 退出）");
-  const toolsServer = createToolsServer({ db, agentDb, dataDir, accounts, creds, caldav });
+  const toolsServer = createToolsServer(
+    { db, agentDb, dataDir, accounts, creds, caldav },
+    { internalKey: INTERNAL_KEY }
+  );
   toolsServer.listen(TOOLS_PORT, HOST, () => {
     console.log(`受限工具面（MCP）已监听 ${HOST}:${TOOLS_PORT}`);
     if (pool && modelCfg) {

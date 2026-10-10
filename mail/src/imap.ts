@@ -123,6 +123,17 @@ export async function openReadOnly(client: ImapFlow, folder: string): Promise<nu
 }
 
 /**
+ * 当前已打开文件夹的 special-use（RFC 6154）。
+ *
+ * imapflow 的 `mailbox.specialUse` 来自 LIST 的标志位；服务端不支持 SPECIAL-USE 时
+ * 它会按**本地化名字**推断（阿里云的「已发送 / 垃圾邮件 / 归档」都在它的名单里）。
+ * 服务端既没给标志位、名字也认不出时为空串。
+ */
+export function openedSpecialUse(client: ImapFlow): string {
+  return client.mailbox ? (client.mailbox.specialUse ?? "") : "";
+}
+
+/**
  * 列出 lastSeenUid 之后的新邮件元数据（envelope 级，不含正文）。
  * 注意必须先收集完再返回：fetch 流未耗尽时在同一连接上发新命令会死锁。
  *

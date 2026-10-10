@@ -73,7 +73,7 @@ pnpm typecheck
 
 - **构建上下文 = 仓库根**：webmail 运行时 import `mail/` 的共享模块，且 Node 按「引用方所在目录」解析依赖——镜像里同时装两棵树：`webmail/node_modules`（全量，tsx 在 devDependencies、是运行时启动器）与 `mail/node_modules`（`--prod`）。
 - 构建：`docker build -f webmail.Dockerfile -t webmail .`（better-sqlite3 在 alpine 上源码编译，python3/make/g++ 仅存在于 builder 阶段）。
-- 运行形态：运行身份由 compose 的 `user:` 指定（`WEBMAIL_UID`/`WEBMAIL_GID`，与宿主站点属主一致——VPS 上为 1002=ysy、本地缺省 1000；镜像内建用户 1001 仅是不覆盖时的缺省）；烘焙 `WEBMAIL_DATA_DIR=/data`、`WEBMAIL_HOST=0.0.0.0`；**不发布任何宿主端口**——只在 compose 网络内可达（信任边界 = 网络隔离 + 站点代理的 `isOwner` 守卫）。
+- 运行形态：运行身份由 compose 的 `user:` 指定（`WEBMAIL_UID`/`WEBMAIL_GID`，与宿主站点属主一致——VPS 上为 1002=ysy、本地缺省 1000；镜像内建用户 1001 仅是不覆盖时的缺省）；烘焙 `WEBMAIL_DATA_DIR=/data`、`WEBMAIL_HOST=0.0.0.0`；**不发布任何宿主端口**——只在 compose 网络内可达（信任边界 = 网络隔离 + 站点代理的 `isOwner` 守卫 + `x-internal-key` 共享密钥：代理注入、后端比对，绑非回环地址时 `WEBMAIL_INTERNAL_KEY` 必填）。
 - 部署：compose 服务 `webmail`（`./webmail-data:/data`）；`deploy.yml` 每次构建推送 `ghcr.io/shaoyuanyu/webmail:latest`，VPS 拉取后 `docker compose up -d --no-deps web webmail`。
 
 ## 实现经验（实测踩过的）

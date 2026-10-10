@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { openDb } from "../../mail/src/db.js";
 import { hasPendingBackfill } from "../../mail/src/fetcher.js";
+import { isLoopbackHost } from "../../mail/src/internal-key.js";
 import { backfillRefs } from "../../mail/src/message.js";
 import { createApiServer, isFullSyncInFlight, runSync, type WebmailContext } from "./api.js";
 import { repairAccountColorsFile } from "./accounts.js";
@@ -19,8 +20,21 @@ const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 60_000);
  * 期间 LIST / 发信 / 标记都能插进来。
  */
 const BACKFILL_TICK_MS = Number(process.env.WEBMAIL_BACKFILL_TICK_MS ?? 1500);
+/**
+ * 内部密钥（站点代理以 `x-internal-key` 注入）。**绑非回环地址时必填**：
+ * API 包含发信、删除、账号管理等写操作，只靠网络隔离一旦部署配置写错就是完全敞开。
+ * 回环监听（本地开发）时可以不配。
+ */
+const INTERNAL_KEY = process.env.WEBMAIL_INTERNAL_KEY ?? "";
 
 async function main() {
+  if (!isLoopbackHost(HOST) && !INTERNAL_KEY) {
+    throw new Error(
+      `WEBMAIL_HOST=${HOST} 绑定的不是回环地址，但 WEBMAIL_INTERNAL_KEY 为空——` +
+        "任何能连上该端口的人都能读写邮箱。" +
+        "请在 webmaild 与站点两侧同时配置同一个密钥（站点代理转发时注入 x-internal-key）。"
+    );
+  }
   const dataDir = webmailDataDir();
   const { accounts, remoteImageDomains } = loadAccounts(dataDir);
   // 撞色自动修复（2026-10-09）：缺省色写死年代留下的账号至今同色，用户不该为此手动改。
@@ -91,7 +105,7 @@ async function main() {
     mirrorDrafts(ctx).catch((err) => console.error("[webmaild] 草稿镜像失败：", err));
   }, MIRROR_SWEEP_MS);
 
-  const server = createApiServer(ctx);
+  const server = createApiServer(ctx, { internalKey: INTERNAL_KEY });
   server.listen(PORT, HOST, () => {
     console.log(`[webmaild] API 监听 ${HOST}:${PORT}，数据目录 ${dataDir}`);
   });

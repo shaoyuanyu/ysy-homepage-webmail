@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { simpleParser } from "mailparser";
 import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
+import { headerValue, INTERNAL_KEY_HEADER, internalKeyMatches } from "../../mail/src/internal-key.js";
 import { backfillProgress, hasPendingBackfill, syncAccount, type SyncOptions } from "../../mail/src/fetcher.js";
 import { searchMessages } from "../../mail/src/search.js";
 import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
@@ -61,6 +62,9 @@ interface CopyRow {
   folder: string;
   uid: number;
   flags: string;
+  /** 文件夹的 RFC 6154 特殊用途（同步时写入数据库，见 mail/src/fetcher.ts 的 saveFolder）；
+   *  服务端没给标志位又认不出名字时为空串。前端据此判定「是否我发出的」。 */
+  special_use: string;
 }
 
 interface MessageRow {
@@ -106,7 +110,13 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 
 function copiesOf(ctx: WebmailContext, messageId: string): CopyRow[] {
   return ctx.db
-    .prepare("SELECT account_id, folder, uid, flags FROM copies WHERE message_id = ?")
+    .prepare(
+      `SELECT c.account_id, c.folder, c.uid, c.flags,
+              COALESCE(f.special_use, '') AS special_use
+       FROM copies c
+       LEFT JOIN folders f ON f.account_id = c.account_id AND f.path = c.folder
+       WHERE c.message_id = ?`
+    )
     .all(messageId) as CopyRow[];
 }
 
@@ -161,7 +171,12 @@ function listItem(
     hasReadState: readCopies.length > 0,
     flagged,
     hasAttach: row.has_attach === 1,
-    copies: copies.map((c) => ({ accountId: c.account_id, folder: c.folder, uid: c.uid })),
+    copies: copies.map((c) => ({
+      accountId: c.account_id,
+      folder: c.folder,
+      uid: c.uid,
+      specialUse: c.special_use,
+    })),
     accounts: [...new Set(copies.map((c) => c.account_id))],
   };
 }
@@ -1098,9 +1113,20 @@ async function doRunSync(
   return out;
 }
 
-export function createApiServer(ctx: WebmailContext): Server {
+export function createApiServer(
+  ctx: WebmailContext,
+  opts?: { internalKey?: string }
+): Server {
   return createServer(async (req, res) => {
     try {
+      // 内部密钥：绑非回环地址时由入口（index.ts）传入并强制要求（见 mail/src/internal-key.ts）。
+      // 站点代理转发时注入 `x-internal-key`；不一致就拒绝，不再只依赖网络隔离。
+      if (
+        opts?.internalKey &&
+        !internalKeyMatches(headerValue(req.headers, INTERNAL_KEY_HEADER), opts.internalKey)
+      ) {
+        return json(res, 401, { error: "unauthorized" });
+      }
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const path = url.pathname;
 

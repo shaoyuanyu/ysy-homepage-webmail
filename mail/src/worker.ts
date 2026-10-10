@@ -1,6 +1,7 @@
 import { generateText, stepCountIs, type LanguageModel } from "ai";
 import { createMCPClient, type MCPClient } from "@ai-sdk/mcp";
 import { claimTask, failTask, finishTask, type Task } from "./queue.js";
+import { INTERNAL_KEY_HEADER } from "./internal-key.js";
 import { judgeMessage, recordJudgment } from "./judge.js";
 import { listPendingSends, type AgentDb } from "./ledger.js";
 
@@ -17,6 +18,8 @@ export interface WorkerDeps {
   agentDb: AgentDb;
   /** 工具面 MCP 地址（http://127.0.0.1:9711/mcp） */
   mcpUrl: string;
+  /** 工具面的内部密钥（与 MAIL_AGENT_INTERNAL_KEY 同一个值）：自连时注入 x-internal-key */
+  internalKey?: string;
   model: LanguageModel;
   modelName: string;
   /** 每日汇报与指令回执的收件人（me@，在发信白名单内） */
@@ -68,7 +71,13 @@ export class WorkerPool {
   private async tools(): Promise<ReturnType<MCPClient["tools"]>> {
     if (!this.mcp) {
       this.mcp = await createMCPClient({
-        transport: { type: "http", url: this.deps.mcpUrl },
+        transport: {
+          type: "http",
+          url: this.deps.mcpUrl,
+          ...(this.deps.internalKey
+            ? { headers: { [INTERNAL_KEY_HEADER]: this.deps.internalKey } }
+            : {}),
+        },
       });
     }
     return this.mcp.tools();
