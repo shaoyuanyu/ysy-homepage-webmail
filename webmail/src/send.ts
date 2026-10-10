@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import nodemailer from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { connectAccount } from "../../mail/src/imap.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import type { SendInput, SendResult, WebmailAccount } from "./types.js";
 import { appendRaw, detectSentFolder } from "./write.js";
@@ -64,7 +65,9 @@ export async function sendMessage(
   const raw = await composer.compile().build();
 
   // 先探测「已发送」文件夹：找不到就拒发（红线 5：不留底到错误位置、也不出现已发出却没留底）
-  const imap = await connectAccount(account, cred);
+  // ⚠ 连接走池（pool.ts）。这里它会在 **SMTP 发送期间一直握着**（可能几十秒）——取用期间
+  //   池不保活，而服务端的空闲超时是分钟级，不会因此被断。
+  const imap = await acquireConnection(account.id, () => connectAccount(account, cred));
   let sentFolder: string;
   try {
     const detected = await detectSentFolder(imap);
@@ -73,7 +76,7 @@ export async function sendMessage(
     }
     sentFolder = detected;
   } catch (err) {
-    await imap.logout().catch(() => {});
+    releaseConnection(imap);
     throw err;
   }
 
@@ -99,7 +102,7 @@ export async function sendMessage(
   try {
     await appendRaw(imap, sentFolder, raw);
   } finally {
-    await imap.logout().catch(() => {});
+    releaseConnection(imap);
   }
 
   return { messageId, sentFolder };

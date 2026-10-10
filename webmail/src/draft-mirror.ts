@@ -5,6 +5,7 @@ import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
 import type { WebmailContext } from "./api.js";
 import { withAccountLock } from "./locks.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 import type { WebmailAccount } from "./types.js";
 import { detectDraftsFolder } from "./write.js";
 
@@ -200,7 +201,7 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
       .get(row.id) as { server_dirty: number } | undefined;
     if (!current || current.server_dirty === 0) return;
 
-    const client = await connectAccount(account, cred);
+    const client = await acquireConnection(account.id, () => connectAccount(account, cred));
     try {
       const folder = await detectDraftsFolder(client);
       if (!folder) throw new Error(`账号 ${account.id} 找不到「草稿」文件夹（\\Drafts 与常见名均无）`);
@@ -231,7 +232,7 @@ async function mirrorOne(ctx: WebmailContext, row: MirrorRow): Promise<void> {
         )
         .run(account.id, folder, appended.uid, uidvalidity, row.id);
     } finally {
-      await client.logout().catch(() => {});
+      releaseConnection(client);
     }
   });
 }
@@ -302,7 +303,7 @@ export async function deleteServerDraftCopy(
   if (!account || !cred) return { deleted: false, reason: "account-missing" };
 
   return withAccountLock(account.id, async () => {
-    const client = await connectAccount(account, cred);
+    const client = await acquireConnection(account.id, () => connectAccount(account, cred));
     try {
       const mb = await client.mailboxOpen(ref.folder, { readOnly: false });
       const uidvalidity = String(mb.uidValidity ?? "");
@@ -312,7 +313,7 @@ export async function deleteServerDraftCopy(
       await client.messageDelete(String(ref.uid), { uid: true }); // 不存在时返回 false，等价于已删
       return { deleted: true };
     } finally {
-      await client.logout().catch(() => {});
+      releaseConnection(client);
     }
   });
 }

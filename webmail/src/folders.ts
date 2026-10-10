@@ -1,5 +1,6 @@
 import type { ImapFlow } from "imapflow";
 import { connectAccount } from "../../mail/src/imap.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import { withAccountLock } from "./locks.js";
 import type { WebmailAccount } from "./types.js";
@@ -122,8 +123,34 @@ export async function listFoldersWith(client: ImapFlow): Promise<FolderInfo[]> {
   return toFolderInfo(await client.list());
 }
 
-/** 列出某个账号的文件夹（短时连接 + 账号锁，与其它 IMAP 操作串行） */
+/**
+ * 列出某个账号的文件夹（池化连接 + 账号锁，与其它 IMAP 操作串行）。
+ * ⚠ 连接测试 / 预览这个场景**不要**用它，用 `listFoldersFresh`（理由见那个函数的注释）。
+ */
 export async function listAccountFolders(
+  account: WebmailAccount,
+  cred: AccountCredential
+): Promise<FolderInfo[]> {
+  return withAccountLock(account.id, async () => {
+    const client = await acquireConnection(account.id, () => connectAccount(account, cred));
+    try {
+      return await listFoldersWith(client);
+    } finally {
+      releaseConnection(client);
+    }
+  });
+}
+
+/**
+ * 用一条**全新**连接列文件夹——连接测试 / 预览专用（`previewFolders`）。
+ *
+ * ⚠ **这一条绝不能走连接池**（2026-10-10 加池时当场被用例拦下）：预览用的 account.id 是
+ *   固定的 `__preview__`，而池是按 accountId 存连接的——用正确密码试过一次之后，改成
+ *   **错误密码**再试会**复用上一条连接**，于是「密码错」也显示成功（用例里就是
+ *   `expect(bad.status).toBe(502)` 红了）。预览的语义就是「拿这一组参数当场试一次」，
+ *   天生不该复用。
+ */
+export async function listFoldersFresh(
   account: WebmailAccount,
   cred: AccountCredential
 ): Promise<FolderInfo[]> {

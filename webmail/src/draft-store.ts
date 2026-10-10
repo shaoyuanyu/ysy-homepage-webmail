@@ -5,6 +5,7 @@ import { connectAccount } from "../../mail/src/imap.js";
 import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
 import { getDraft, type Draft } from "./drafts.js";
 import { withAccountLock } from "./locks.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 // ⚠ 只是类型：`api.ts` 运行时会 import 本模块，值导入会构成循环
 import type { WebmailContext } from "./api.js";
 import { detectDraftsFolder } from "./write.js";
@@ -278,7 +279,7 @@ export async function refreshDraftBox(ctx: WebmailContext): Promise<RefreshResul
     if (ttl > 0 && Date.now() - last < ttl) continue;
     try {
       const rows = await withAccountLock(account.id, async () => {
-        const client = await connectAccount(account, cred);
+        const client = await acquireConnection(account.id, () => connectAccount(account, cred));
         try {
           const folder = await detectDraftsFolder(client);
           // 这个账号在服务商那边**根本没有草稿文件夹**（例如从没写过草稿）：它就是没有草稿，
@@ -308,7 +309,7 @@ export async function refreshDraftBox(ctx: WebmailContext): Promise<RefreshResul
           pruneEnvelopes(ctx.db, { accountId: account.id, folder, uidvalidity }, out.map((r) => r.uid));
           return out;
         } finally {
-          await client.logout().catch(() => {});
+          releaseConnection(client);
         }
       });
       synced += rows.length;
@@ -337,7 +338,7 @@ export async function readDraft(ctx: WebmailContext, id: string): Promise<Draft 
   if (!ref || !account || !cred) return row;
   try {
     const raw = await withAccountLock(account.id, async () => {
-      const client = await connectAccount(account, cred);
+      const client = await acquireConnection(account.id, () => connectAccount(account, cred));
       try {
         const mb = await client.mailboxOpen(ref.folder, { readOnly: true });
         // uidvalidity 不一致 = 邮箱被重建，这个 UID 已经没有意义了
@@ -345,7 +346,7 @@ export async function readDraft(ctx: WebmailContext, id: string): Promise<Draft 
         const msg = await client.fetchOne(String(ref.uid), { source: true }, { uid: true });
         return msg && msg.source ? msg.source : null;
       } finally {
-        await client.logout().catch(() => {});
+        releaseConnection(client);
       }
     });
     if (!raw) return row;

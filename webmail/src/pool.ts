@@ -153,3 +153,14 @@ export function releaseConnection(client: ImapFlow): void {
 export function pooledAccounts(): string[] {
   return [...pool.keys()];
 }
+
+/**
+ * 让某个账号的池化连接**立刻失效**（关掉并从池里摘除）。
+ *
+ * ⚠ 账号配置变更（host / port / 用户名）或删除账号后**必须调**：池是按 accountId 存的，
+ *   不失效的话下一次操作会**拿着旧参数连过去**——症状是「改了配置还是连老服务器」或
+ *   「删了账号还在发请求」，而且看上去一切正常（2026-10-10 加池时预判到的失效点）。
+ */
+export function dropConnection(accountId: string): void {
+  drop(accountId);
+}

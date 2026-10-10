@@ -4,7 +4,8 @@ import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import type { AccountCredential, CredentialsFile } from "../../mail/src/types.js";
 import type { WebmailContext } from "./api.js";
-import { listAccountFolders, listFoldersWith, suggestSyncFolders, type FolderInfo } from "./folders.js";
+import { listFoldersFresh, listFoldersWith, suggestSyncFolders, type FolderInfo } from "./folders.js";
+import { dropConnection } from "./pool.js";
 import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
 import type { WebmailAccount, WebmailAccountsFile } from "./types.js";
 
@@ -328,7 +329,10 @@ export async function previewFolders(
   // 不是客户端错误）；不包装的话会落到 API 层的兜底 500，前端与测试都分不清
   let folders: FolderInfo[];
   try {
-    folders = await listAccountFolders(account, cred);
+    // ⚠ **预览走 `listFoldersFresh`（一条全新连接），不走连接池**：预览用的
+    //   `account.id` 是固定的 `__preview__`，而池是按 accountId 存的——复用上一条会
+    //   让「改了密码再试」永远显示成功（用例 `expect(bad.status).toBe(502)` 当场拦下）。
+    folders = await listFoldersFresh(account, cred);
   } catch (err) {
     throw new AccountError(
       `IMAP 连接失败：${err instanceof Error ? err.message : String(err)}`,
@@ -554,6 +558,9 @@ export async function updateAccount(
     ctx.credentials.set(id, prevCred);
     throw err;
   }
+  // ⚠ 连接参数变了就必须让池里那条旧连接失效（见 dropConnection 的注释：不失效的话
+  //   下一次操作会拿着**旧 host / 旧密码**连过去，而且看上去一切正常）。
+  if (connectionChanged) dropConnection(id);
   return toSummary(next);
 }
 
@@ -573,6 +580,8 @@ export function deleteAccount(ctx: WebmailContext, id: string): AccountSummary {
   ctx.accounts.delete(id);
   ctx.credentials.delete(id);
   ctx.syncStates.delete(id);
+  // 账号没了，池里那条连接也留着（不关的话它会一直在服务端挂着，直到闲置回收）
+  dropConnection(id);
   persistAccounts(ctx);
   persistCredentials(ctx);
   return toSummary(account);
