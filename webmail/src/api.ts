@@ -8,7 +8,7 @@ import { headerValue, INTERNAL_KEY_HEADER, internalKeyMatches } from "../../mail
 import { backfillProgress, hasPendingBackfill, syncAccount, type SyncOptions } from "../../mail/src/fetcher.js";
 import { searchMessages } from "../../mail/src/search.js";
 import { pruneOrphanMessages, removeEmlFiles } from "../../mail/src/message.js";
-import { threadMessageIds } from "../../mail/src/thread.js";
+import { threadMessageIds, threadRootKeys } from "../../mail/src/thread.js";
 import type { AccountCredential } from "../../mail/src/types.js";
 import type { CopyRef, FlagChange, SendInput, WebmailAccount } from "./types.js";
 import {
@@ -34,7 +34,7 @@ import { createDraft, deleteDraft, findDrafts, listDrafts, updateDraft, type Dra
 import { withAccountLock } from "./locks.js";
 import { renderMailHtml } from "./render.js";
 import { sendMessage } from "./send.js";
-import { applyFlagChange, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
+import { applyFlagChange, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, openReadWrite, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
 
 /** 前端代理前缀：cid 内联附件重写到这个前缀下（webmaild 自身只绑回环） */
 const PUBLIC_PREFIX = process.env.WEBMAIL_PUBLIC_PREFIX ?? "/api/mail";
@@ -171,6 +171,11 @@ function listItem(
     hasReadState: readCopies.length > 0,
     flagged,
     hasAttach: row.has_attach === 1,
+    /**
+     * 会话键（列表聚合用）。这里先填自己——真实值由列表查询用 `threadRootKeys`
+     * 批量覆盖（那里才有「一批邮件」的上下文，详情页不需要它）。
+     */
+    threadKey: row.message_id,
     copies: copies.map((c) => ({
       accountId: c.account_id,
       folder: c.folder,
@@ -569,7 +574,12 @@ function listMessages(ctx: WebmailContext, url: URL) {
   const next = rows.length > limit && last?.date ? `${last.date}|${last.message_id}` : null;
   // ⚠ readFolders 必须传：给了 folder 的视图（「垃圾」tab）里，行的已读态要跟着那个范围走，
   //   否则行显示"已读"、`filter=unseen` 却把它筛出来（同一个判据两处写法就会这样）
-  return { items: page.map((r) => listItem(ctx, r, names, folder)), next };
+  const items = page.map((r) => listItem(ctx, r, names, folder));
+  // 会话键（2026-10-10「列表会话聚合」）：同一会话的邮件共用一个键，前端据此合并成一行
+  // （并就地展开）。键可能指向一封**不在本地库**的老邮件——前端只当不透明字符串用。
+  const roots = threadRootKeys(ctx.db, items.map((i) => i.messageId));
+  for (const item of items) item.threadKey = roots.get(item.messageId) ?? item.messageId;
+  return { items, next };
 }
 
 /** 附件清单（精简原文才有；NULL = 原文完整，按整封解析） */
@@ -1001,6 +1011,71 @@ async function applyCopiesOp(
   return { affected, skipped };
 }
 
+/**
+ * 撤销「标为垃圾」：把刚被 `\Junk` 搬走的邮件搬回原处（2026-10-10，用户要求）。
+ *
+ * 为什么不由前端反向调 `/move`：MOVE 之后那封邮件在垃圾文件夹里的 **UID 是新的**
+ * （RFC 6851 的目标端会分配新 UID，而 imapflow 2.0.6 不暴露 COPYUID），本地索引要等
+ * 下一轮同步才知道新 UID——撤销窗口只有几秒，等不起。所以在这里**现场定位**：
+ * 打开垃圾夹、`UID SEARCH HEADER Message-ID` 找到那一封，再搬回它的原文件夹。
+ *
+ * ⚠ 匹配值用库键里的 normalized Message-ID（去尖括号、小写）：IMAP 的 SEARCH 是
+ *   子串 + 大小写不敏感，规范化后的串正是原始头值的子串，故能命中。
+ *   没有 Message-ID 的邮件（库键 `auto:` 前缀）**无法定位**，如实记 skipped——不猜。
+ * ⚠ 本地索引只删「垃圾夹里那一行」（若已同步到）。**不 prune**：信仍在原文件夹里，
+ *   下一轮同步会在那儿重建副本行；prune 会把 messages 行与原文文件一并清掉，
+ *   于是刚恢复的邮件在本地变成没正文的空壳。
+ */
+async function undoJunkMove(
+  ctx: WebmailContext,
+  messageId: string,
+  targets: { accountId: string; folder: string }[]
+) {
+  const bare = messageId.startsWith("mid:") ? messageId.slice(4) : null;
+  let restored = 0;
+  const skipped: { accountId: string; reason: string }[] = [];
+
+  for (const target of targets) {
+    if (!bare) {
+      skipped.push({ accountId: target.accountId, reason: "这封邮件没有 Message-ID，无法定位" });
+      continue;
+    }
+    const account = ctx.accounts.get(target.accountId);
+    const cred = ctx.credentials.get(target.accountId);
+    if (!account || !cred) {
+      skipped.push({ accountId: target.accountId, reason: `账号未配置：${target.accountId}` });
+      continue;
+    }
+    await withAccountLock(target.accountId, async () => {
+      const client = await connectAccount(account, cred);
+      try {
+        const junk = await resolveMoveTarget(client, "\\Junk");
+        if (!junk) {
+          skipped.push({ accountId: target.accountId, reason: "该账号没有「垃圾邮件」文件夹" });
+          return;
+        }
+        await openReadWrite(client, junk);
+        const found = await client.search({ header: { "Message-ID": bare } }, { uid: true });
+        const uids = Array.isArray(found) ? found : [];
+        if (uids.length === 0) {
+          skipped.push({ accountId: target.accountId, reason: "在垃圾邮件文件夹里找不到这封邮件" });
+          return;
+        }
+        // 多个命中（同一封信重复进垃圾夹）时取最新的那个
+        const uid = Math.max(...uids);
+        await moveUid(client, junk, uid, target.folder);
+        ctx.db
+          .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
+          .run(target.accountId, junk, uid);
+        restored++;
+      } finally {
+        await client.logout().catch(() => {});
+      }
+    });
+  }
+  return { restored, skipped };
+}
+
 /** 一轮同步的结果：成功结果与逐账号错误分开收集 */
 export interface SyncRoundResult {
   results: unknown[];
@@ -1398,6 +1473,27 @@ export function createApiServer(
         }
         const op = path === "/move" ? "move" : "delete";
         return json(res, 200, await applyCopiesOp(ctx, body.copies, op, body.to));
+      }
+
+      // 撤销「标为垃圾」（2026-10-10）：把刚搬进垃圾夹的邮件搬回原处。
+      // body `{ messageId, targets: [{ accountId, folder }] }`：folder = 原文件夹
+      // （前端从搬走前那份 `copies` 里取），一封邮件可能在多个账号各有一份。
+      if (req.method === "POST" && path === "/unmove") {
+        const body = (await readBody(req)) as { messageId?: unknown; targets?: unknown };
+        if (typeof body.messageId !== "string" || body.messageId.length === 0) {
+          return json(res, 400, { error: "缺少 messageId" });
+        }
+        const targets = Array.isArray(body.targets)
+          ? (body.targets as { accountId?: unknown; folder?: unknown }[]).filter(
+              (t): t is { accountId: string; folder: string } =>
+                typeof t?.accountId === "string" &&
+                typeof t?.folder === "string" &&
+                t.accountId.length > 0 &&
+                t.folder.length > 0
+            )
+          : [];
+        if (targets.length === 0) return json(res, 400, { error: "缺少 targets" });
+        return json(res, 200, await undoJunkMove(ctx, body.messageId, targets));
       }
 
       if (req.method === "GET" && path === "/contacts") {

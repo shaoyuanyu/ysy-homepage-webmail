@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { openDb, type Db } from "../src/db.js";
 import type { NewMeta } from "../src/imap.js";
 import { backfillRefs, extractRefKeys, ingestMessage, refKeyOf } from "../src/message.js";
-import { threadMessageIds } from "../src/thread.js";
+import { threadMessageIds, threadRootKeys } from "../src/thread.js";
 import { fixturesDir, workRoot } from "./dovecot.js";
 
 let db: Db;
@@ -184,5 +184,54 @@ describe("ingestMessage 与 backfillRefs", () => {
       .get(r.messageId) as { refs_json: string; truncated: number };
     expect(row.truncated).toBe(1);
     expect(JSON.parse(row.refs_json)).toEqual([]);
+  });
+});
+
+/**
+ * 会话「根」键（2026-10-10 列表聚合）——列表一行代表一个会话靠它分组，
+ * 所以「同一会话的每一封都拿到同一个键」是硬要求。
+ */
+describe("threadRootKeys", () => {
+  it("完整引用链：各环与根同一键；只有 In-Reply-To 的那封也归到同一个根", () => {
+    insertMsg(db, "mid:rk-root@t", "2026-09-25T10:00:00.000Z", []);
+    insertMsg(db, "mid:rk-b@t", "2026-09-25T11:00:00.000Z", ["mid:rk-root@t"]);
+    insertMsg(db, "mid:rk-c@t", "2026-09-25T12:00:00.000Z", ["mid:rk-root@t", "mid:rk-b@t"]);
+    // 只有 In-Reply-To（没有 References）：refs[0] = 父，往上再走一层同样落到根
+    insertMsg(db, "mid:rk-d@t", "2026-09-25T13:00:00.000Z", ["mid:rk-b@t"]);
+
+    const roots = threadRootKeys(db, [
+      "mid:rk-root@t",
+      "mid:rk-b@t",
+      "mid:rk-c@t",
+      "mid:rk-d@t",
+    ]);
+    for (const id of ["mid:rk-root@t", "mid:rk-b@t", "mid:rk-c@t", "mid:rk-d@t"]) {
+      expect(roots.get(id), id).toBe("mid:rk-root@t");
+    }
+  });
+
+  it("根不在本地库时用那个库外键当会话键（同一会话的回复仍是一致的）", () => {
+    // 更早的邮件没进同步范围：refs[0] 指向的 mid 在 messages 表里查不到
+    insertMsg(db, "mid:rk-orphan1@t", "2026-09-25T10:00:00.000Z", ["mid:rk-ghost@t"]);
+    insertMsg(db, "mid:rk-orphan2@t", "2026-09-25T11:00:00.000Z", ["mid:rk-ghost@t"]);
+
+    const roots = threadRootKeys(db, ["mid:rk-orphan1@t", "mid:rk-orphan2@t"]);
+    expect(roots.get("mid:rk-orphan1@t")).toBe("mid:rk-ghost@t");
+    expect(roots.get("mid:rk-orphan2@t")).toBe("mid:rk-ghost@t");
+  });
+
+  it("无引用链的邮件归自己；不相干的两封不会合到一起", () => {
+    insertMsg(db, "mid:rk-solo1@t", "2026-09-25T10:00:00.000Z", []);
+    insertMsg(db, "mid:rk-solo2@t", "2026-09-25T11:00:00.000Z", null);
+
+    const roots = threadRootKeys(db, ["mid:rk-solo1@t", "mid:rk-solo2@t"]);
+    expect(roots.get("mid:rk-solo1@t")).toBe("mid:rk-solo1@t");
+    expect(roots.get("mid:rk-solo2@t")).toBe("mid:rk-solo2@t");
+  });
+
+  it("空输入不报错；单个邮件也返回映射", () => {
+    expect(threadRootKeys(db, []).size).toBe(0);
+    const one = threadRootKeys(db, ["mid:rk-root@t"]);
+    expect(one.get("mid:rk-root@t")).toBe("mid:rk-root@t");
   });
 });

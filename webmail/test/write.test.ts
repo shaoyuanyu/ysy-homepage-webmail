@@ -430,4 +430,73 @@ describe("webmaild 写操作", () => {
     expect(body.skipped).toEqual([]);
     expect((await readAllFlags(dovecot, "test", "test", "Junk")).size).toBe(1);
   });
+
+  /**
+   * 撤销「标为垃圾」（2026-10-10）：MOVE 之后那封邮件在垃圾夹里的 **UID 已经变了**，
+   * 前端手里的 `copies` 全是过期的——服务端只能自己用 `SEARCH HEADER Message-ID`
+   * 现场定位，再搬回它的原文件夹。
+   */
+  it("撤销标为垃圾：按 Message-ID 在垃圾夹里定位并搬回原文件夹", async () => {
+    const listed = (await (await fetch(`${base}/messages`)).json()) as {
+      items: { messageId: string; copies: { accountId: string; folder: string; uid: number }[] }[];
+    };
+    const target = listed.items.find(
+      (i) =>
+        i.copies.some((c) => c.accountId === "acc1" && c.folder === "INBOX") &&
+        i.copies.some((c) => c.accountId === "acc2" && c.folder === "INBOX"),
+    );
+    expect(target).toBeTruthy();
+    const copy = target!.copies.find((c) => c.accountId === "acc1" && c.folder === "INBOX")!;
+    const inboxBefore = (await readAllFlags(dovecot, "test", "test", "INBOX")).size;
+    // ⚠ 前面的用例往垃圾夹里留下过邮件，这里不能假设它是空的——只比相对数量
+    const junkBefore = (await readAllFlags(dovecot, "test", "test", "Junk")).size;
+
+    await api("/move", { copies: [copy], to: "\\Junk" });
+    expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore - 1);
+    expect((await readAllFlags(dovecot, "test", "test", "Junk")).size).toBe(junkBefore + 1);
+
+    // targets 用的是**搬走前**那份 copies 的（账号, 文件夹）——即它该回到的地方
+    const body = (await (
+      await api("/unmove", {
+        messageId: target!.messageId,
+        targets: [{ accountId: "acc1", folder: "INBOX" }],
+      })
+    ).json()) as { restored: number; skipped: unknown[] };
+    expect(body.restored).toBe(1);
+    expect(body.skipped).toEqual([]);
+
+    // 垃圾夹回到搬之前的样子（**只搬回它自己那一封**，更早那封原地不动）
+    expect((await readAllFlags(dovecot, "test", "test", "Junk")).size).toBe(junkBefore);
+    expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore);
+
+    // 搬回来的新副本由下一轮同步发现（本地索引在撤销时只清掉垃圾夹里那一行）
+    await api("/sync");
+    const detail = (await (
+      await fetch(`${base}/message/${encodeURIComponent(target!.messageId)}`)
+    ).json()) as { copies: { accountId: string; folder: string }[] };
+    expect(detail.copies.some((c) => c.accountId === "acc1" && c.folder === "INBOX")).toBe(true);
+  });
+
+  it("撤销：垃圾夹里找不到那封（已被别的客户端处理过）→ 记 skipped，不报错", async () => {
+    const body = (await (
+      await api("/unmove", {
+        messageId: "mid:nowhere@test.local",
+        targets: [{ accountId: "acc1", folder: "INBOX" }],
+      })
+    ).json()) as { restored: number; skipped: { accountId: string; reason: string }[] };
+    expect(body.restored).toBe(0);
+    expect(body.skipped).toHaveLength(1);
+    expect(body.skipped[0].accountId).toBe("acc1");
+  });
+
+  it("撤销：没有 Message-ID 的邮件（auto: 键）无法定位，如实跳过", async () => {
+    const body = (await (
+      await api("/unmove", {
+        messageId: "auto:deadbeef",
+        targets: [{ accountId: "acc1", folder: "INBOX" }],
+      })
+    ).json()) as { restored: number; skipped: { reason: string }[] };
+    expect(body.restored).toBe(0);
+    expect(body.skipped[0].reason).toContain("Message-ID");
+  });
 });
