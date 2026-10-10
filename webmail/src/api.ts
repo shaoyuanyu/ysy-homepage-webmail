@@ -1017,7 +1017,13 @@ async function applyCopiesOp(
  * 为什么不由前端反向调 `/move`：MOVE 之后那封邮件在垃圾文件夹里的 **UID 是新的**
  * （RFC 6851 的目标端会分配新 UID，而 imapflow 2.0.6 不暴露 COPYUID），本地索引要等
  * 下一轮同步才知道新 UID——撤销窗口只有几秒，等不起。所以在这里**现场定位**：
- * 打开垃圾夹、`UID SEARCH HEADER Message-ID` 找到那一封，再搬回它的原文件夹。
+ * 打开垃圾夹、`UID SEARCH HEADER Message-ID` 找到那一封，再搬回目标文件夹。
+ *
+ * 目标有两种来源（`target.folder`）：
+ * - **给了**：撤销场景——前端手里有「搬走前那份 copies」，原文件夹是确定的；
+ * - **不给**：默认 `INBOX`。「垃圾」tab 的行内「移出垃圾」（2026-10-10）走这条——
+ *   那里前端**只知道**副本位置就是垃圾夹本身（它是搬来之后的态），原文件夹无从得知。
+ *   `INBOX` 是 RFC 3501 保证存在且大小写不敏感的收件箱名。
  *
  * ⚠ 匹配值用库键里的 normalized Message-ID（去尖括号、小写）：IMAP 的 SEARCH 是
  *   子串 + 大小写不敏感，规范化后的串正是原始头值的子串，故能命中。
@@ -1029,7 +1035,7 @@ async function applyCopiesOp(
 async function undoJunkMove(
   ctx: WebmailContext,
   messageId: string,
-  targets: { accountId: string; folder: string }[]
+  targets: { accountId: string; folder?: string }[]
 ) {
   const bare = messageId.startsWith("mid:") ? messageId.slice(4) : null;
   let restored = 0;
@@ -1063,7 +1069,7 @@ async function undoJunkMove(
         }
         // 多个命中（同一封信重复进垃圾夹）时取最新的那个
         const uid = Math.max(...uids);
-        await moveUid(client, junk, uid, target.folder);
+        await moveUid(client, junk, uid, target.folder || "INBOX");
         ctx.db
           .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
           .run(target.accountId, junk, uid);
@@ -1475,9 +1481,10 @@ export function createApiServer(
         return json(res, 200, await applyCopiesOp(ctx, body.copies, op, body.to));
       }
 
-      // 撤销「标为垃圾」（2026-10-10）：把刚搬进垃圾夹的邮件搬回原处。
-      // body `{ messageId, targets: [{ accountId, folder }] }`：folder = 原文件夹
-      // （前端从搬走前那份 `copies` 里取），一封邮件可能在多个账号各有一份。
+      // 撤销「标为垃圾」/「移出垃圾」（2026-10-10）：把邮件从垃圾夹里搬走。
+      // body `{ messageId, targets: [{ accountId, folder? }] }`：
+      // - 撤销场景给 `folder`（搬走前那份 copies 的原文件夹）；
+      // - 「垃圾」tab 的「移出垃圾」不给 → 默认搬回 INBOX（那里前端不知道原文件夹）。
       if (req.method === "POST" && path === "/unmove") {
         const body = (await readBody(req)) as { messageId?: unknown; targets?: unknown };
         if (typeof body.messageId !== "string" || body.messageId.length === 0) {
@@ -1485,11 +1492,10 @@ export function createApiServer(
         }
         const targets = Array.isArray(body.targets)
           ? (body.targets as { accountId?: unknown; folder?: unknown }[]).filter(
-              (t): t is { accountId: string; folder: string } =>
+              (t): t is { accountId: string; folder?: string } =>
                 typeof t?.accountId === "string" &&
-                typeof t?.folder === "string" &&
                 t.accountId.length > 0 &&
-                t.folder.length > 0
+                (t.folder === undefined || typeof t.folder === "string")
             )
           : [];
         if (targets.length === 0) return json(res, 400, { error: "缺少 targets" });

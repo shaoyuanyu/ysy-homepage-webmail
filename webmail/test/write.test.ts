@@ -499,4 +499,35 @@ describe("webmaild 写操作", () => {
     expect(body.restored).toBe(0);
     expect(body.skipped[0].reason).toContain("Message-ID");
   });
+
+  /**
+   * 「垃圾」tab 的行内「移出垃圾」（2026-10-10）：那里前端**不知道**原文件夹
+   * （手里的副本位置就是垃圾夹本身），故 targets 只给账号，服务端缺省搬回 INBOX。
+   */
+  it("移出垃圾（targets 不给 folder）：默认搬回收件箱", async () => {
+    const listed = (await (await fetch(`${base}/messages`)).json()) as {
+      items: { messageId: string; copies: { accountId: string; folder: string; uid: number }[] }[];
+    };
+    const target = listed.items.find(
+      (i) =>
+        i.copies.some((c) => c.accountId === "acc1" && c.folder === "INBOX") &&
+        i.copies.some((c) => c.accountId === "acc2" && c.folder === "INBOX"),
+    );
+    expect(target).toBeTruthy();
+    const copy = target!.copies.find((c) => c.accountId === "acc1" && c.folder === "INBOX")!;
+    const inboxBefore = (await readAllFlags(dovecot, "test", "test", "INBOX")).size;
+
+    await api("/move", { copies: [copy], to: "\\Junk" });
+    expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore - 1);
+
+    const body = (await (
+      await api("/unmove", {
+        messageId: target!.messageId,
+        targets: [{ accountId: "acc1" }],
+      })
+    ).json()) as { restored: number; skipped: unknown[] };
+    expect(body.restored).toBe(1);
+    expect(body.skipped).toEqual([]);
+    expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore);
+  });
 });
