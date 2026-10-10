@@ -6,6 +6,7 @@ import { connectAccount, fetchPartBody, fetchSource, openReadOnly } from "../../
 import { decodePartPayload, type AttachmentEntry } from "../../mail/src/mime.js";
 import { extractRefKeys, snippetOf } from "../../mail/src/message.js";
 import { withAccountLock } from "./locks.js";
+import { acquireConnection, releaseConnection } from "./pool.js";
 import type { WebmailContext } from "./api.js";
 
 /**
@@ -64,12 +65,12 @@ export async function fetchTruncatedSource(
     }
     try {
       const raw = await withAccountLock(account.id, async () => {
-        const client = await connectAccount(account, cred);
+        const client = await acquireConnection(account.id, () => connectAccount(account, cred));
         try {
           await openReadOnly(client, copy.folder); // 只读打开：不写 \Seen（红线 1）
           return await fetchSource(client, copy.uid);
         } finally {
-          await client.logout().catch(() => {});
+          releaseConnection(client);
         }
       });
       if (!raw || raw.length === 0) {
@@ -149,7 +150,7 @@ export async function fetchDeferredAttachment(
     if (!account || !cred) continue;
     try {
       return await withAccountLock(account.id, async () => {
-        const client = await connectAccount(account, cred);
+        const client = await acquireConnection(account.id, () => connectAccount(account, cred));
         try {
           await openReadOnly(client, copy.folder); // 只读 EXAMINE，不动任何标记
           const rawPart = await fetchPartBody(client, copy.uid, entry.part!);
@@ -157,7 +158,7 @@ export async function fetchDeferredAttachment(
           //   否则「点附件」下回来的是 base64 文本（2026-10-08 实测）
           return rawPart ? decodePartPayload(rawPart, entry.encoding) : null;
         } finally {
-          await client.logout().catch(() => {});
+          releaseConnection(client);
         }
       });
     } catch {
