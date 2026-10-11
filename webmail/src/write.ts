@@ -23,7 +23,8 @@ export async function setFlags(
 }
 
 /**
- * 批量写标记（2026-10-07，多选批量操作）：一个文件夹一次 `STORE`。
+ * 批量写标记（2026-10-07，多选批量操作）：一个文件夹一次 `STORE`（UID 太多时分块，
+ * 见 `chunkUids`）。
  *
  * 与 `setFlags` 同一红线（只 +FLAGS / -FLAGS，绝不裸 FLAGS 整体替换；一律 `{ uid: true }`）：
  * 把一批 UID 用逗号拼成序列集，加标记一次、去标记一次——不按 UID 逐个往返（那是 N 次
@@ -45,12 +46,14 @@ export async function setFlagsBatch(
   if (change.flagged === false) del.push("\\Flagged");
   if (add.length === 0 && del.length === 0) return;
   await openReadWrite(client, folder);
-  const set = uids.join(",");
-  if (add.length > 0) {
-    await client.messageFlagsAdd(set, add, { uid: true });
-  }
-  if (del.length > 0) {
-    await client.messageFlagsRemove(set, del, { uid: true });
+  for (const chunk of chunkUids(uids)) {
+    const set = chunk.join(",");
+    if (add.length > 0) {
+      await client.messageFlagsAdd(set, add, { uid: true });
+    }
+    if (del.length > 0) {
+      await client.messageFlagsRemove(set, del, { uid: true });
+    }
   }
 }
 
@@ -69,7 +72,8 @@ export function applyFlagChange(flags: string, change: FlagChange): string {
 }
 
 /**
- * 批量补 \Seen（2026-10-05，「一键已读」用）：一次 STORE 写一组 UID。
+ * 批量补 \Seen（2026-10-05，「一键已读」用）：一次 STORE 写一组 UID（超长时分块，
+ * 见 `chunkUids`）。
  * 与 `setFlags` 同一红线（只 +FLAGS、绝不整体替换；一律 `{ uid: true }`）——
  * 「把一批未读标成已读」只需要加标记，不需要按 UID 逐个往返。
  * 调用方保证 uids 来自本地索引（copies 表），且已按文件夹分组。
@@ -81,7 +85,29 @@ export async function setSeenBatch(
 ): Promise<void> {
   if (uids.length === 0) return;
   await openReadWrite(client, folder);
-  await client.messageFlagsAdd(uids.join(","), ["\\Seen"], { uid: true });
+  for (const chunk of chunkUids(uids)) {
+    await client.messageFlagsAdd(chunk.join(","), ["\\Seen"], { uid: true });
+  }
+}
+
+/**
+ * 单条 STORE 命令里最多拼多少个 UID。
+ *
+ * 为什么必须有：「全选全部匹配」会一次送上几千个 UID，而 UID 序列集是**一条命令**的
+ * 参数字面量，长度有上限（实测的两种拒绝是 `BAD` 与直接断连；阿里云、QQ 都不友好）。
+ * 分块发送效果与一次发完等价（同一组 UID、同一组标记），只是分成多条命令。
+ */
+export const UID_CHUNK_SIZE = 500;
+
+/** 把 UID 列表切成 `UID_CHUNK_SIZE` 一段（不超过一段时原样返回，不额外分配；空入参给空） */
+export function chunkUids(uids: number[]): number[][] {
+  if (uids.length === 0) return [];
+  if (uids.length <= UID_CHUNK_SIZE) return [uids];
+  const out: number[][] = [];
+  for (let i = 0; i < uids.length; i += UID_CHUNK_SIZE) {
+    out.push(uids.slice(i, i + UID_CHUNK_SIZE));
+  }
+  return out;
 }
 
 /**

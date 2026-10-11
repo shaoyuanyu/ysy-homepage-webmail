@@ -5,11 +5,13 @@ import { createApiServer } from "../src/api.js";
 import { makeContext, type TestContext } from "./context.js";
 import {
   deliverFixtures,
+  deliverRaw,
   readAllFlags,
   startDovecot,
   waitReady,
   type DovecotHandle,
 } from "./dovecot.js";
+import { chunkUids, UID_CHUNK_SIZE } from "../src/write.js";
 import { startSmtpSink, type SmtpSink } from "./smtp-sink.js";
 
 let dovecot: DovecotHandle;
@@ -529,5 +531,137 @@ describe("webmaild 写操作", () => {
     expect(body.restored).toBe(1);
     expect(body.skipped).toEqual([]);
     expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore);
+  });
+});
+
+/**
+ * `chunkUids`：把 UID 序列集分块的上限（2026-10-11）。
+ *
+ * 纯函数，不碰网络——但它守着的是「全选全部匹配」那条路：一次几千个 UID 拼成**一条**
+ * STORE 命令会被服务商拒/断连（不是理论风险，测试里不断言是因为没法定量复现）。
+ */
+describe("chunkUids：STORE 命令的 UID 分块", () => {
+  it("空输入给空（调用方在更外层就早退了，这里不造空段）", () => {
+    expect(chunkUids([])).toEqual([]);
+  });
+
+  it("不超过一段时原样一层", () => {
+    expect(chunkUids([7])).toEqual([[7]]);
+    const exactly = Array.from({ length: UID_CHUNK_SIZE }, (_, i) => i + 1);
+    expect(chunkUids(exactly)).toEqual([exactly]);
+  });
+
+  it("超过一段就分段，不丢不重且保持原顺序", () => {
+    const uids = Array.from({ length: UID_CHUNK_SIZE + 1 }, (_, i) => i + 1);
+    const chunks = chunkUids(uids);
+    expect(chunks.map((c) => c.length)).toEqual([UID_CHUNK_SIZE, 1]);
+    expect(chunks.flat()).toEqual(uids);
+  });
+
+  it("三段场景：1500 个 UID → 500 / 500 / 500", () => {
+    const chunks = chunkUids(Array.from({ length: UID_CHUNK_SIZE * 3 }, (_, i) => i + 1));
+    expect(chunks.map((c) => c.length)).toEqual([UID_CHUNK_SIZE, UID_CHUNK_SIZE, UID_CHUNK_SIZE]);
+    expect(chunks[0][0]).toBe(1);
+    expect(chunks[2].at(-1)).toBe(UID_CHUNK_SIZE * 3);
+  });
+});
+
+/**
+ * 「全选」= 视图口径下**全部匹配**（2026-10-11 用户要求）。
+ *
+ * 与 `scope.test.ts`（造库、不连网）的分工：那边管计数口径与上限拒绝，这里管**真写回**
+ * ——范围标记/删除确实落到 IMAP 上，且不受「只加载了一页」的限制。
+ */
+describe("范围执行（scope）：全选全部匹配", () => {
+  /** 搜索用的唯一标记（放在前 3 封的主题里）—— 用来造一个「匹配 3 封」的小范围 */
+  const MARKER = "ZQQMARKER";
+  /** 投递量 > 一页（50），才谈得上「计数不等于已加载」 */
+  const N = 55;
+
+  const rawOf = (i: number, subject: string) =>
+    Buffer.from(
+      [
+        "From: bulk@local",
+        "To: test@local",
+        `Subject: ${subject}`,
+        `Message-ID: <mid:scope-${i}@test.local>`,
+        "Date: Mon, 05 Oct 2026 10:00:00 +0800",
+        "",
+        "正文",
+      ].join("\r\n")
+    );
+
+  beforeAll(async () => {
+    const raws: Buffer[] = [];
+    for (let i = 0; i < N; i++) {
+      raws.push(rawOf(i, i < 3 ? `${MARKER} ${i}` : `批量 ${i}`));
+    }
+    await deliverRaw(dovecot, "test", "test", raws, "INBOX");
+    await api("/sync");
+  }, 120_000);
+
+  it("计数给全部匹配、列表只给一页 —— 证明「全选」不再等于「已加载」", async () => {
+    const list = (await (await fetch(`${base}/messages?account=acc1`)).json()) as {
+      items: unknown[];
+      next: string | null;
+    };
+    expect(list.items.length).toBe(50);
+    expect(list.next).not.toBeNull();
+    const count = (await (
+      await fetch(`${base}/messages/count?account=acc1`)
+    ).json()) as { count: number };
+    expect(count.count).toBeGreaterThan(50);
+    expect(count.count).toBeGreaterThanOrEqual(N);
+  });
+
+  it("scope 标记：一次写回全部匹配（含没加载出来的那些），收件箱副本全部带上 \\Seen", async () => {
+    const res = await api("/flags", { scope: "account=acc1", seen: true });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { messages: number; updated: number; skipped: unknown[] };
+    // 覆盖的封数 > 一页 —— 若走的是「已加载的 50 封」那条路，这里就是 50
+    expect(body.messages).toBeGreaterThan(50);
+    expect(body.skipped).toEqual([]);
+
+    const flags = await readAllFlags(dovecot, "test", "test", "INBOX");
+    const stillUnread = [...flags.values()].filter((f) => !f.includes("\\Seen"));
+    expect(stillUnread).toEqual([]);
+  });
+
+  it("scope 删除（搜索范围命中 3 封）：只删这 3 封，别的原样", async () => {
+    const q = encodeURIComponent(MARKER);
+    const before = (await (
+      await fetch(`${base}/messages/count?q=${q}`)
+    ).json()) as { count: number };
+    expect(before.count).toBe(3);
+
+    const other = (await (
+      await fetch(`${base}/messages/count?account=acc1`)
+    ).json()) as { count: number };
+    const inboxBefore = (await readAllFlags(dovecot, "test", "test", "INBOX")).size;
+
+    const res = await api("/delete", { scope: `q=${q}` });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { affected: number }).affected).toBe(3);
+
+    // 本地索引立即对得上（删除会 prune 掉没有副本的消息）
+    const after = (await (
+      await fetch(`${base}/messages/count?q=${q}`)
+    ).json()) as { count: number };
+    expect(after.count).toBe(0);
+    const rest = (await (
+      await fetch(`${base}/messages/count?account=acc1`)
+    ).json()) as { count: number };
+    expect(rest.count).toBe(other.count - 3);
+
+    // ⚠ 服务端也真的删了（只看本地索引会漏掉"本地清了、服务器还在"这类错）
+    // 不用 SEARCH HEADER 定位：两家国内服务商对它的实现都是坏的（见红线 24），
+    // 这里只数封数，不依赖那类命令。
+    expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore - 3);
+  });
+
+  it("scope 删除超过 20 封 → 400（服务端自己判，不依赖前端按钮变灰）", async () => {
+    const res = await api("/delete", { scope: "account=acc1" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("最多删除 20 封");
   });
 });

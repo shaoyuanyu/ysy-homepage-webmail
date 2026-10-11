@@ -42,6 +42,15 @@ const PUBLIC_PREFIX = process.env.WEBMAIL_PUBLIC_PREFIX ?? "/api/mail";
 /** POST body 上限：附件 base64 会膨胀约 1/3，放宽到 40MB */
 const MAX_BODY_BYTES = 40 * 1024 * 1024;
 
+/**
+ * 一次「全选全部匹配」删除的**封数**上限（2026-10-11 用户定稿：一次不超过 20 封）。
+ *
+ * 为什么要服务端也判：前端把删除按钮变灰只是**提示**，不是边界——按钮态、键盘、直接打接口
+ * 都是绕过它的路。两个仓各持一份常量（前端 `MAX_BATCH_DELETE`，不跨包 import），改时必须同步。
+ * 上限只作用于 `scope` 路径：既有按 `copies` 删的路保持原样（不改既有行为）。
+ */
+const MAX_SCOPE_DELETE_MESSAGES = 20;
+
 export interface SyncState {
   lastSync: string | null;
   lastError: string | null;
@@ -486,38 +495,45 @@ function folderClause(folders: FolderParam[], alias: string): { sql: string; par
   return { sql: `(${clauses.join(" OR ")})`, params };
 }
 
+/** 列表查询参数 —— 「视图口径」的**唯一解析点**（列表 / 计数 / 全选执行三处共用） */
+interface ListQuery {
+  accountIds: string[];
+  q: string | undefined;
+  /** 分页游标（`date|messageId`）；「全选全部匹配」不带它 */
+  before: string | null;
+  filter: string | null;
+  direction: string | null;
+  folder: FolderParam[] | undefined;
+  limit: number;
+}
+
+function parseListQuery(url: URL): ListQuery {
+  return {
+    accountIds: (url.searchParams.get("account") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    q: url.searchParams.get("q")?.trim(),
+    before: url.searchParams.get("before"),
+    filter: url.searchParams.get("filter"),
+    direction: url.searchParams.get("direction"),
+    folder: parseFolderParams(url.searchParams.getAll("folder")),
+    limit: parseLimit(url.searchParams.get("limit")),
+  };
+}
+
 /**
- * 合并视图：跨账号按时间倒序，游标（date, messageId）分页。
- * `account` 支持逗号分隔多值（2026-10-05 起，多选账号筛选取**并集**；单值写法不变）。
+ * 「视图口径」的 where 片段 + 占位符参数 —— **列表分页、计数、全选执行三处共用同一份**。
+ *
+ * 为什么必须只写一份（2026-10-11）：「全选」不再只选已加载的那几页，而是按**用户此刻看到的
+ * 同一口径**在服务端全量执行。口径两处漂移 = 选中/删掉的那批与看到的不是同一批，这类不一致
+ * 极难排查（本仓库已经因为「同一判据两处写法」栽过两次：加粗却筛不出来、改了界面不变）。
+ *
+ * ⚠ 搜索（`q`）走不到这里：它由 `searchMessages` + `matchFilter` 的 JS 路径实现，
+ *   见 `matchingMessageIds`。
  */
-function listMessages(ctx: WebmailContext, url: URL) {
-  const accountIds = (url.searchParams.get("account") ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const q = url.searchParams.get("q")?.trim();
-  const before = url.searchParams.get("before");
-  const filter = url.searchParams.get("filter");
-  const direction = url.searchParams.get("direction");
-  const folder = parseFolderParams(url.searchParams.getAll("folder"));
-  const limit = parseLimit(url.searchParams.get("limit"));
-  const names = contactNameMap(ctx.db);
-
-  if (q) {
-    const hits = searchMessages(ctx.db, q, limit);
-    const items = hits
-      .map((h) => messageOf(ctx, h.messageId))
-      .filter((r): r is MessageRow => !!r)
-      .filter(
-        (r) =>
-          !accountIds.length ||
-          copiesOf(ctx, r.message_id).some((c) => accountIds.includes(c.account_id)),
-      )
-      .filter((r) => matchFilter(ctx, r.message_id, filter, direction, folder, accountIds))
-      .map((r) => listItem(ctx, r, names, folder));
-    return { items, next: null };
-  }
-
+function listWhere(query: ListQuery): { sql: string; params: unknown[] } {
+  const { accountIds, before, filter, direction, folder } = query;
   const params: unknown[] = [];
   let where = `1=1 AND ${NOT_DRAFT_SQL}`;
   // 垃圾邮件不是「邮件」（见 NOT_JUNK_ONLY_SQL）：不给 folder 时排除「只躺在垃圾文件夹里」的。
@@ -567,6 +583,77 @@ function listMessages(ctx: WebmailContext, url: URL) {
     where += ` AND EXISTS (SELECT 1 FROM copies c WHERE c.message_id = m.message_id AND ${scope.sql})`;
     params.push(...scope.params);
   }
+  return { sql: where, params };
+}
+
+/**
+ * 「视图口径」下**全部匹配**的 message_id（不分页 = 不受已加载页数限制）。
+ *
+ * 用途：`GET /messages/count` 的计数、`POST /flags` / `POST /delete` 带 `scope` 时的目标集合。
+ *
+ * ⚠ 搜索路径的 `limit` 是**搜索本身的上限**（FTS 命中条数，见 `searchMessages`），不是分页
+ *   大小：`/messages` 的搜索视图没有游标（`next: null`），「搜索里的全部匹配」本来就只到
+ *   那一页为止 —— 这里保持一致，绝不偷偷扩大范围（否则「点了全选却动了更多」）。
+ */
+function matchingMessageIds(ctx: WebmailContext, query: ListQuery): string[] {
+  if (query.q) {
+    return searchMessages(ctx.db, query.q, query.limit)
+      .map((h) => h.messageId)
+      .filter((id) => {
+        if (!messageOf(ctx, id)) return false;
+        if (
+          query.accountIds.length &&
+          !copiesOf(ctx, id).some((c) => query.accountIds.includes(c.account_id))
+        ) {
+          return false;
+        }
+        return matchFilter(ctx, id, query.filter, query.direction, query.folder, query.accountIds);
+      });
+  }
+  const { sql: where, params } = listWhere(query);
+  return (
+    ctx.db.prepare(`SELECT m.message_id FROM messages m WHERE ${where}`).all(...params) as {
+      message_id: string;
+    }[]
+  ).map((r) => r.message_id);
+}
+
+/**
+ * `scope` 参数（`POST /flags` / `POST /delete` 的可选字段）→ 视图口径的匹配集合。
+ *
+ * 传输形式就是**列表那串查询串**（`account=…&filter=…&q=…`，不带 `?`）：前端把加载列表时
+ * 用的那串原样发过来，服务端用同一个 `parseListQuery` 解析 —— 口径不可能漂移，前端也不必
+ * 物化几千个 messageId。
+ */
+function scopeMessageIds(ctx: WebmailContext, scope: string): string[] {
+  return matchingMessageIds(ctx, parseListQuery(new URL(`/?${scope}`, "http://127.0.0.1")));
+}
+
+/**
+ * 合并视图：跨账号按时间倒序，游标（date, messageId）分页。
+ * `account` 支持逗号分隔多值（2026-10-05 起，多选账号筛选取**并集**；单值写法不变）。
+ */
+function listMessages(ctx: WebmailContext, url: URL) {
+  const query = parseListQuery(url);
+  const { filter, direction, folder, limit, accountIds } = query;
+  const names = contactNameMap(ctx.db);
+
+  if (query.q) {
+    const hits = searchMessages(ctx.db, query.q, limit);
+    const items = hits
+      .map((h) => messageOf(ctx, h.messageId))
+      .filter((r): r is MessageRow => !!r)
+      .filter(
+        (r) =>
+          !accountIds.length ||
+          copiesOf(ctx, r.message_id).some((c) => accountIds.includes(c.account_id)),
+      )
+      .filter((r) => matchFilter(ctx, r.message_id, filter, direction, folder, accountIds))
+      .map((r) => listItem(ctx, r, names, folder));
+    return { items, next: null };
+  }
+
+  const { sql: where, params } = listWhere(query);
   const rows = ctx.db
     .prepare(`SELECT m.* FROM messages m WHERE ${where} ORDER BY m.date DESC, m.message_id DESC LIMIT ?`)
     .all(...params, limit + 1) as MessageRow[];
@@ -1340,6 +1427,16 @@ export function createApiServer(
         return json(res, 200, listMessages(ctx, url));
       }
 
+      /**
+       * 「全选」的范围数字（2026-10-11）：与 `/messages` **同一套筛选参数**，返回视图口径下
+       * 全部匹配的封数（不分页）。前端用它把「全选」从「已加载的几十行」变成「全部匹配的 N 封」，
+       * 也用它判断删除按钮要不要禁用（> 20 封）。
+       * ⚠ 必须与 `/messages` 用同一个 `parseListQuery`，否则数字与列表不是同一批。
+       */
+      if (req.method === "GET" && path === "/messages/count") {
+        return json(res, 200, { count: matchingMessageIds(ctx, parseListQuery(url)).length });
+      }
+
       // 文件夹清单（2026-10-07）：账号管理弹窗的文件夹选择器 + 详情页「移动」的目标列表
       if (req.method === "GET" && path === "/folders") {
         const accountId = url.searchParams.get("account")?.trim() ?? "";
@@ -1459,11 +1556,22 @@ export function createApiServer(
         const body = (await readBody(req)) as {
           messageId?: string;
           messageIds?: unknown;
+          /** 视图口径的查询串（「全选全部匹配」）；见 `scopeMessageIds` */
+          scope?: unknown;
         } & FlagChange;
         if (body.seen === undefined && body.flagged === undefined) {
           return json(res, 400, { error: "缺少标记变更（seen / flagged）" });
         }
         // 批量（2026-10-07，多选）：messageIds 优先；单条仍用 messageId
+        // 范围（2026-10-11「全选全部匹配」）：`scope` = 列表那串查询串，服务端自己按同一
+        // 口径选行 —— 不走 messageIds（几千个 id 要物化、还要塞进一条 body）。
+        // ⚠ 这条分支没有 500 封那条限：那是对**请求体**规模的上限，而这里目标集合是服务端
+        //   自己算的，实际写回成本由 `setFlagsBatch` 的 UID 分块控制。
+        if (typeof body.scope === "string") {
+          const ids = scopeMessageIds(ctx, body.scope);
+          if (ids.length === 0) return json(res, 200, { updated: 0, messages: 0, skipped: [] });
+          return json(res, 200, await applyFlagsBatch(ctx, ids, body));
+        }
         const ids = Array.isArray(body.messageIds)
           ? body.messageIds.filter((m): m is string => typeof m === "string" && m.length > 0)
           : [];
@@ -1490,11 +1598,31 @@ export function createApiServer(
       }
 
       if (req.method === "POST" && (path === "/move" || path === "/delete")) {
-        const body = (await readBody(req)) as { copies?: CopyRef[]; to?: string };
+        const body = (await readBody(req)) as { copies?: CopyRef[]; to?: string; scope?: unknown };
+        const op = path === "/move" ? "move" : "delete";
+        /**
+         * 范围删除（2026-10-11「全选全部匹配」）：`scope` = 列表那串查询串，口径与列表所见一致。
+         * 删的是这些邮件的**全部副本**（红线 8）。
+         * ⚠ 服务端独立设一道上限（`MAX_SCOPE_DELETE_MESSAGES`）：删除不可撤销，按钮变灰只是
+         *   提示，不是边界。超了直接拒，让「手滑删掉整个邮箱」在协议层就不可能发生。
+         */
+        if (typeof body.scope === "string") {
+          if (op !== "delete") return json(res, 400, { error: "scope 只支持 delete" });
+          const ids = scopeMessageIds(ctx, body.scope);
+          if (ids.length === 0) return json(res, 200, { affected: 0 });
+          if (ids.length > MAX_SCOPE_DELETE_MESSAGES) {
+            return json(res, 400, {
+              error: `一次最多删除 ${MAX_SCOPE_DELETE_MESSAGES} 封（当前匹配 ${ids.length} 封）`,
+            });
+          }
+          const copies = ids.flatMap((id) =>
+            copiesOf(ctx, id).map((c) => ({ accountId: c.account_id, folder: c.folder, uid: c.uid })),
+          );
+          return json(res, 200, await applyCopiesOp(ctx, copies, "delete"));
+        }
         if (!Array.isArray(body.copies) || body.copies.length === 0) {
           return json(res, 400, { error: "缺少 copies" });
         }
-        const op = path === "/move" ? "move" : "delete";
         return json(res, 200, await applyCopiesOp(ctx, body.copies, op, body.to));
       }
 
