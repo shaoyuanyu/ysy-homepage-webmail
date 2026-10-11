@@ -81,6 +81,17 @@ function migrate(db: Db): void {
     );
     CREATE INDEX IF NOT EXISTS copies_message ON copies(message_id);
 
+    -- 用户自己搬动过的邮件（见 webmail/src/api.ts 的 noteUserMove）：MOVE 之后目标
+    -- 文件夹给这封信分配的是**新的 UID**（RFC 6851），同步器在增量里见到它时与「刚到的
+    -- 新信」无从区分。「收到新邮件」提醒据此把它排除掉——提醒只认收件箱里真的新到的信
+    -- （判据见 webmail/src/api.ts 的 doRunSync）。行由写入方按 TTL 清理（USER_MOVE_TTL_MS）：
+    -- 需要覆盖的窗口只有「搬动 → 目标文件夹被下一轮同步扫过」这几秒，搬去了不参与同步的
+    -- 文件夹时不会有同步轮来消费它。
+    CREATE TABLE IF NOT EXISTS moved_by_user (
+      message_id TEXT PRIMARY KEY,
+      moved_at TEXT NOT NULL
+    );
+
     -- 全文索引：trigram 分词，原生支持中文子串模糊搜索（MAIL-AGENT.md 6.1）
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       message_id UNINDEXED,

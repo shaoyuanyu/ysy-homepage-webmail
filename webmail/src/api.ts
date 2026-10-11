@@ -54,8 +54,41 @@ const MAX_SCOPE_DELETE_MESSAGES = 20;
 export interface SyncState {
   lastSync: string | null;
   lastError: string | null;
-  /** 上次本轮同步实际抓进新邮件的时刻（fetched > 0 才刷新）；安静期保持不变 */
+  /** 上次**收件箱里真的新收到**邮件的时刻（判据见 doRunSync）；安静期保持不变 */
   lastNewMail: string | null;
+}
+
+/**
+ * 「用户自己搬动过的邮件」名单（表 `moved_by_user`，见 mail/src/db.ts）。
+ *
+ * MOVE 之后**目标文件夹给这封信分配的是新 UID**（RFC 6851）：同步器在增量里见到它时，
+ * 与「刚到的新信」长得一模一样。要把它从「收到新邮件」提醒里排除，只能由搬动的一方
+ * 自己记下来——写入点只有两处，都在账号锁内、搬动成功之后立刻写：
+ * - `applyCopiesOp` 的移动分支（「标为垃圾」、垃圾视图里的「移出垃圾」）；
+ * - `undoJunkMove`（撤销「标为垃圾」）。
+ *
+ * 读的一侧只有 `doRunSync` 判定 `lastNewMail`。需要覆盖的窗口只有「搬动 → 目标文件夹
+ * 被下一轮同步扫过」这几秒（前端每次搬动后都会主动催一次该账号的同步）；行本身留到
+ * TTL 到期——`noteUserMove` 顺手清掉过期的，搬去了不参与同步的文件夹时不会有同步轮
+ * 来消费它。
+ */
+const USER_MOVE_TTL_MS = 60 * 60_000;
+
+const movedCutoff = (): string => new Date(Date.now() - USER_MOVE_TTL_MS).toISOString();
+
+function noteUserMove(db: Db, messageId: string): void {
+  db.prepare("DELETE FROM moved_by_user WHERE moved_at < ?").run(movedCutoff());
+  db.prepare("INSERT OR REPLACE INTO moved_by_user (message_id, moved_at) VALUES (?, ?)").run(
+    messageId,
+    new Date().toISOString()
+  );
+}
+
+function isUserMove(db: Db, messageId: string): boolean {
+  const row = db
+    .prepare("SELECT moved_at FROM moved_by_user WHERE message_id = ?")
+    .get(messageId) as { moved_at: string } | undefined;
+  return row !== undefined && row.moved_at >= movedCutoff();
 }
 
 export interface WebmailContext {
@@ -1028,6 +1061,14 @@ async function markAllRead(ctx: WebmailContext, accountIds: string[], folders?: 
   return result;
 }
 
+/** 「(账号, 文件夹, UID) → 库键」；源副本行还在时才查得到（搬动 / 删除之后就没了） */
+function copyMessageId(db: Db, c: CopyRef): string | undefined {
+  const row = db
+    .prepare("SELECT message_id FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
+    .get(c.accountId, c.folder, c.uid) as { message_id: string } | undefined;
+  return row?.message_id;
+}
+
 /** 移动 / 删除：按账号分组逐条执行，成功后本地副本行按「源位置已不存在」处理 */
 async function applyCopiesOp(
   ctx: WebmailContext,
@@ -1071,6 +1112,11 @@ async function applyCopiesOp(
             // 前端无从预判，故这道兜底必须在服务端（本地行照旧不动——信确实还在那儿）。
             if (c.folder === target) continue;
             await moveUid(client, c.folder, c.uid, target!);
+            // 这封是用户自己搬的（见 noteUserMove）：目标文件夹给它配的是新 UID，同步器
+            // 在增量里会当成刚到的新邮件。必须在账号锁内、搬完立刻写——锁一放，等着的那
+            // 一轮同步就会先去扫目标文件夹；库键用搬动前的源副本行查。
+            const movedId = copyMessageId(ctx.db, c);
+            if (movedId) noteUserMove(ctx.db, movedId);
           } else {
             await deleteUid(client, c.folder, c.uid);
           }
@@ -1089,13 +1135,11 @@ async function applyCopiesOp(
     const affectedMessages = new Set<string>();
     const pruned = ctx.db.transaction(() => {
       for (const c of handled) {
-        const row = ctx.db
-          .prepare("SELECT message_id FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
-          .get(c.accountId, c.folder, c.uid) as { message_id: string } | undefined;
+        const messageId = copyMessageId(ctx.db, c);
         ctx.db
           .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
           .run(c.accountId, c.folder, c.uid);
-        if (row) affectedMessages.add(row.message_id);
+        if (messageId) affectedMessages.add(messageId);
       }
       return pruneOrphanMessages(ctx.db, { candidates: [...affectedMessages], collectEml: true });
     })();
@@ -1180,6 +1224,9 @@ async function undoJunkMove(
         // 多个命中（同一封信重复进垃圾夹）时取最新的那个
         const uid = Math.max(...wanted);
         await moveUid(client, junk, uid, target.folder || "INBOX");
+        // 这封是用户自己搬回去的（见 noteUserMove）：搬进目标文件夹后它拿的是新 UID，
+        // 同步器会把它当成刚到的新邮件
+        noteUserMove(ctx.db, messageId);
         ctx.db
           .prepare("DELETE FROM copies WHERE account_id = ? AND folder = ? AND uid = ?")
           .run(target.accountId, junk, uid);
@@ -1272,11 +1319,23 @@ async function doRunSync(
       const now = new Date().toISOString();
       state.lastSync = now;
       state.lastError = null;
-      // 本轮确实抓进**新**邮件才刷新 lastNewMail——「上次收到新邮件」的语义，
-      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）。
-      // ⚠ 回填的历史邮件不算新邮件（`fetched - backfilled`）：否则首轮每抓一块
-      //   都会把前端提醒刷成「收到 N 封新邮件」，几百封旧信被当成刚到的。
-      if (r.some((x) => x.fetched - x.backfilled > 0)) state.lastNewMail = now;
+      // 本轮**收件箱里真的新到了信**才刷新 lastNewMail——「上次收到新邮件」的语义，
+      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）。两个条件缺一不可：
+      // 1. 只有收件箱算「收到邮件」：别的文件夹出现新副本全是我们自己写进去的（发信
+      //    APPEND 到「已发送」、草稿镜像、「标为垃圾」搬进垃圾夹、搬到归档）；
+      // 2. 那封不是用户刚刚自己搬进去的（见 noteUserMove）：「移出垃圾」「撤销标为垃圾」
+      //    把信搬回收件箱，服务端给它配的是新 UID，与刚到的新信无从区分。
+      // ⚠ 历史回填的旧邮件不算（`ingested` 只含增量）：否则首轮每抓一块都会把前端
+      //   提醒刷成「收到 N 封新邮件」，几百封旧信被当成刚到的。
+      if (
+        r.some(
+          (x) =>
+            isInboxFolder(x.folder) &&
+            x.ingested.some((m) => !isUserMove(ctx.db, m.messageId))
+        )
+      ) {
+        state.lastNewMail = now;
+      }
       // 进程重启后内存态丢失：用库里最新一封的日期兜底初始化，
       // 否则重启后要干等下一封新邮件才显示得出时间
       if (!state.lastNewMail) {

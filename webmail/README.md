@@ -11,7 +11,7 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 | `src/write.ts` | IMAP 写操作：`setFlags` / `setFlagsBatch`（`+FLAGS`/`-FLAGS`，批量时一个文件夹一次 `STORE`）、`applyFlagChange`（本地索引重算的纯函数）、`detectSentFolder` / `detectTrashFolder` / `detectDraftsFolder` / `detectJunkFolder`、`appendRaw`、`moveUid`、`deleteUid` |
 | `src/send.ts` | 发信：MailComposer 构造一次 → SMTP 与 `APPEND` 用同一份字节（红线 6）；先探测「已发送」再发信 |
 | `src/render.ts` | HTML 邮件渲染管线：sanitize-html + 远程内容白名单 + cid 重写 + style 里的 url() 剥除（4.4） |
-| `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`，`WEBMAIL_HOST` / `WEBMAIL_PORT` 可调）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接） |
+| `src/api.ts` | HTTP API（node:http，绑 `127.0.0.1:9710`，`WEBMAIL_HOST` / `WEBMAIL_PORT` 可调）；账号级互斥锁（红线 10：每账号同一时刻一条 IMAP 连接）；同步轮 `runSync` 与「收到新邮件」的判据（`lastNewMail`：只认收件箱的增量，并排除用户自己搬动的信） |
 | `src/accounts.ts` | 账号增删（4.11）：`normalizeAccountInput` 纯校验/归一 + `testAccountConnection`（IMAP 登录 + SMTP verify）+ `addAccount` / `deleteAccount`（原子落盘、失败回滚） |
 | `src/contacts.ts` | 通讯录 CRUD + 自动收录（4.10）|
 | `src/folders.ts` | 文件夹清单（4.15）：IMAP `LIST` → `{path,name,specialUse,selectable}`；`suggestSyncFolders`（INBOX + 已发送/垃圾/归档；⚠ 刻意不含草稿与已删除，见 `SUGGESTED_USES` 注记）供新增账号预填 |
@@ -61,6 +61,7 @@ pnpm typecheck
 - **附件门控（2026-10-08，`test/partial-attachment.test.ts`）**：精简原文（正文可读、附件未下载）的完整服务端链路——详情以**清单**给附件（`deferred: true`）与 `partial: true`；内嵌图从本地按 cid 取；被推迟的附件点击时 `BODY.PEEK[part]` **只取那一个部件**并**按传输编码解码**（不下载整封）；**精简原文不算 `.eml` 原件，`GET /source` 一律 404**，`POST /source` 补取后才可下载（补取同时清空清单）。
 - **账号同步状态的归属（2026-10-08，`test/account-state.test.ts`）**：`deleteAccount` 必须把该账号的 `folders` 行（水位线 + 回填游标）与副本一起清掉、并回收孤儿 messages/FTS/原文；`addAccount` 在连接测试通过后、落盘前再清一次同 id 的残留（给已被污染的库兜底）。⚠ 账号 id 由邮箱地址推导，`folders` 行不清 = 「删掉再重加同一个邮箱」继承旧水位线 → 一封信都下不来且无报错（红线 22）。
 - **首轮回填进度（2026-10-08，`test/backfill-progress.test.ts`）**：`GET /health` 每账号带 `backfill`（`remaining/total/done/folder/folders`）——回填未完成时报告剩余量与总量、**不推进 `lastNewMail`**（回填的旧邮件不是新邮件），回填泵跑到铺满后回到 `null`，之后到达的新邮件才把 `lastNewMail` 推到当前时刻。
+- **「收到新邮件」的口径（2026-10-11，`test/new-mail.test.ts`）**：`lastNewMail` 只认**收件箱**里增量入库的信——用户自己的搬动（「标为垃圾」搬进垃圾夹、「移出垃圾」与撤销搬回收件箱）与垃圾夹自己收到的新信都不推进（MOVE 之后目标文件夹给的是新 UID，与刚到的新信无从区分，靠 `moved_by_user` 表排除）。每条「不推进」都与「这封确实走的是增量」一起断言（看 `SyncResult.ingested`）。
 - **原文与取证（2026-10-07）**：把已同步邮件改造成 truncated（删原文 + 清 `eml_path`）后，`GET /source` 404 → `POST /source` 取回并回填（正文/附件/truncated 复位）→ 再 POST 幂等 → `GET /source` 拿到 .eml 字节；详情返回按原文顺序的 `headers`。
 
 ## 备份
