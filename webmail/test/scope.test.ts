@@ -205,4 +205,36 @@ describe("POST /delete|/move 的 scope：范围解析与上限", () => {
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toContain("scope 只支持 delete");
   });
+
+  /**
+   * `exclude`（2026-10-11，「全选后再点掉几封」）必须在**服务端**减掉 —— 否则界面写着
+   * 「已选 6562 封」、实际动了 6563 封。这里用「全部排除 → 目标集合为空 → 直接 200
+   * 且不连 IMAP」来证明它真的生效了（若 exclude 被忽略，61 封 > 20 会被 400 拦下）。
+   */
+  it("scope + exclude：排除掉全部匹配 → 目标为空，200 且不碰 IMAP", async () => {
+    const listed = (await (
+      await fetch(`${base}/messages?account=acc1&limit=200`)
+    ).json()) as { items: { messageId: string }[] };
+    expect(listed.items.length).toBeGreaterThan(20);
+    const all = listed.items.map((i) => i.messageId);
+
+    // 不排除 → 61 封 > 20 上限 → 400（与上一条用例同一个上限）
+    expect((await post("/delete", { scope: "account=acc1" })).status).toBe(400);
+
+    const res = await post("/delete", { scope: "account=acc1", exclude: all });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { affected: number }).affected).toBe(0);
+  });
+
+  it("scope + exclude：排除名单里混入垃圾值（非字符串 / 空串）不影响其余目标", async () => {
+    const listed = (await (
+      await fetch(`${base}/messages?account=acc1&limit=200`)
+    ).json()) as { items: { messageId: string }[] };
+    const res = await post("/delete", {
+      scope: "account=acc1",
+      exclude: [...listed.items.map((i) => i.messageId), null, 42, ""],
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { affected: number }).affected).toBe(0);
+  });
 });

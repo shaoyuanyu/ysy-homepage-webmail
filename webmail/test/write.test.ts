@@ -659,6 +659,33 @@ describe("范围执行（scope）：全选全部匹配", () => {
     expect((await readAllFlags(dovecot, "test", "test", "INBOX")).size).toBe(inboxBefore - 3);
   });
 
+  it("scope + exclude：逐行取消掉的那几封不动，其余照写", async () => {
+    // 先把 acc1 全部标未读（顺带走一遍 `seen: false` 的 scope 路径）
+    await api("/flags", { scope: "account=acc1", seen: false });
+    const listed = (await (
+      await fetch(`${base}/messages?account=acc1&limit=200`)
+    ).json()) as { items: { messageId: string; hasReadState: boolean }[] };
+    // 只挑「有已读状态」的那些：发件 / 归档副本写不进去，也不该被算进提示的封数
+    const writable = listed.items.filter((i) => i.hasReadState).map((i) => i.messageId);
+    expect(writable.length).toBeGreaterThan(6);
+    const excluded = writable.slice(0, 3);
+    const rest = writable.slice(3);
+
+    const res = await api("/flags", { scope: "account=acc1", exclude: excluded, seen: true });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { messages: number; skipped: unknown[] };
+    expect(body.skipped).toEqual([]);
+    // 提示里的封数就是**排除之后**的封数（界面上的数 = 真正动的数）
+    expect(body.messages).toBe(rest.length);
+
+    const after = (await (
+      await fetch(`${base}/messages?account=acc1&limit=200`)
+    ).json()) as { items: { messageId: string; seen: boolean }[] };
+    const seenOf = new Map(after.items.map((i) => [i.messageId, i.seen]));
+    for (const id of excluded) expect(seenOf.get(id)).toBe(false);
+    for (const id of rest) expect(seenOf.get(id)).toBe(true);
+  });
+
   it("scope 删除超过 20 封 → 400（服务端自己判，不依赖前端按钮变灰）", async () => {
     const res = await api("/delete", { scope: "account=acc1" });
     expect(res.status).toBe(400);

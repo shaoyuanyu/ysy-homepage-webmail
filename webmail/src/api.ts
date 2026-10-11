@@ -625,8 +625,14 @@ function matchingMessageIds(ctx: WebmailContext, query: ListQuery): string[] {
  * 用的那串原样发过来，服务端用同一个 `parseListQuery` 解析 —— 口径不可能漂移，前端也不必
  * 物化几千个 messageId。
  */
-function scopeMessageIds(ctx: WebmailContext, scope: string): string[] {
-  return matchingMessageIds(ctx, parseListQuery(new URL(`/?${scope}`, "http://127.0.0.1")));
+function scopeMessageIds(ctx: WebmailContext, scope: string, exclude?: unknown): string[] {
+  const ids = matchingMessageIds(ctx, parseListQuery(new URL(`/?${scope}`, "http://127.0.0.1")));
+  // 「全部匹配」里被用户逐行取消掉的那几封（Gmail 同款：先全选、再点掉个别）。
+  // ⚠ 必须在服务端减掉：否则界面写着「已选 6562 封」、实际动了 6563 封——
+  //   「界面说的数」与「真正动的数」必须是同一批。
+  if (!Array.isArray(exclude) || exclude.length === 0) return ids;
+  const skip = new Set(exclude.filter((x): x is string => typeof x === "string" && x.length > 0));
+  return skip.size === 0 ? ids : ids.filter((id) => !skip.has(id));
 }
 
 /**
@@ -1558,6 +1564,8 @@ export function createApiServer(
           messageIds?: unknown;
           /** 视图口径的查询串（「全选全部匹配」）；见 `scopeMessageIds` */
           scope?: unknown;
+          /** 「全部匹配」里逐行取消掉的那几封 Message-ID；见 `scopeMessageIds` */
+          exclude?: unknown;
         } & FlagChange;
         if (body.seen === undefined && body.flagged === undefined) {
           return json(res, 400, { error: "缺少标记变更（seen / flagged）" });
@@ -1568,7 +1576,7 @@ export function createApiServer(
         // ⚠ 这条分支没有 500 封那条限：那是对**请求体**规模的上限，而这里目标集合是服务端
         //   自己算的，实际写回成本由 `setFlagsBatch` 的 UID 分块控制。
         if (typeof body.scope === "string") {
-          const ids = scopeMessageIds(ctx, body.scope);
+          const ids = scopeMessageIds(ctx, body.scope, body.exclude);
           if (ids.length === 0) return json(res, 200, { updated: 0, messages: 0, skipped: [] });
           return json(res, 200, await applyFlagsBatch(ctx, ids, body));
         }
@@ -1598,7 +1606,13 @@ export function createApiServer(
       }
 
       if (req.method === "POST" && (path === "/move" || path === "/delete")) {
-        const body = (await readBody(req)) as { copies?: CopyRef[]; to?: string; scope?: unknown };
+        const body = (await readBody(req)) as {
+          copies?: CopyRef[];
+          to?: string;
+          scope?: unknown;
+          /** 「全部匹配」里逐行取消掉的那几封 Message-ID；见 `scopeMessageIds` */
+          exclude?: unknown;
+        };
         const op = path === "/move" ? "move" : "delete";
         /**
          * 范围删除（2026-10-11「全选全部匹配」）：`scope` = 列表那串查询串，口径与列表所见一致。
@@ -1608,7 +1622,7 @@ export function createApiServer(
          */
         if (typeof body.scope === "string") {
           if (op !== "delete") return json(res, 400, { error: "scope 只支持 delete" });
-          const ids = scopeMessageIds(ctx, body.scope);
+          const ids = scopeMessageIds(ctx, body.scope, body.exclude);
           if (ids.length === 0) return json(res, 200, { affected: 0 });
           if (ids.length > MAX_SCOPE_DELETE_MESSAGES) {
             return json(res, 400, {
