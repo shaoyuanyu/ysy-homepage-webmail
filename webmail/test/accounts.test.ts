@@ -69,8 +69,13 @@ afterAll(async () => {
 describe("账号管理：输入校验（normalizeAccountInput）", () => {
   const existing = new Set(["me"]);
 
-  it("缺显示名称 / 邮箱非法 / 缺密码 / 端口非法分别报错", () => {
-    expect(() => normalizeAccountInput({}, existing)).toThrow("缺少显示名称");
+  it("邮箱非法 / 缺密码 / 端口非法分别报错；备注名不再必填", () => {
+    // ⚠ 备注名自 2026-10-11 起允许留空（空串 = 没有备注名，站内显示回落邮箱地址），
+    //   所以 `{}` 现在先撞上的是「邮箱地址非法」——不再是「缺少显示名称」
+    expect(() => normalizeAccountInput({}, existing)).toThrow("邮箱地址非法");
+    expect(() => normalizeAccountInput({ displayName: "   " }, existing)).toThrow(
+      "邮箱地址非法"
+    );
     expect(() =>
       normalizeAccountInput({ displayName: "x", email: "not-an-email" }, existing)
     ).toThrow("邮箱地址非法");
@@ -86,6 +91,23 @@ describe("账号管理：输入校验（normalizeAccountInput）", () => {
         existing
       )
     ).toThrow("IMAP 端口非法");
+  });
+
+  it("备注名留空：省略或全空格都归一成空串（= 没有备注名）", () => {
+    const rest = {
+      email: "a@b.c",
+      imapHost: "h",
+      imapPort: 993,
+      imapSecure: true,
+      smtpHost: "h",
+      smtpPort: 465,
+      smtpSecure: true,
+      password: "p",
+    };
+    expect(normalizeAccountInput(rest, new Set()).account.displayName).toBe("");
+    expect(
+      normalizeAccountInput({ ...rest, displayName: "   " }, new Set()).account.displayName
+    ).toBe("");
   });
 
   it("id 冲突报 409；自动推导 id 并去重", () => {
@@ -332,7 +354,7 @@ describe("账号管理：增删（真实 dovecot + smtp sink）", () => {
     expect(readAccounts(tc.dir).accounts.length).toBe(before);
   });
 
-  it("HTTP：修改账号（PUT）——备注名/发件人姓名/文件夹；元数据变更不测连接；404/400", async () => {
+  it("HTTP：修改账号（PUT）——备注名/发件人姓名/文件夹；元数据变更不测连接；404；备注名可清空", async () => {
     // 只改元数据（备注名 / 发件人姓名 / 文件夹）：不触发连接测试，立即 200
     const res = await api("/accounts/acc2", {
       method: "PUT",
@@ -377,19 +399,24 @@ describe("账号管理：增删（真实 dovecot + smtp sink）", () => {
     expect(cleared.senderName).toBe("");
     expect(tc.ctx.accounts.get("acc2")?.senderName).toBeUndefined();
 
-    // 不存在的账号 → 404；备注名清空 → 400
+    // 不存在的账号 → 404
     const nope = await api("/accounts/nope", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ displayName: "x" }),
     });
     expect(nope.status).toBe(404);
-    const bad = await api("/accounts/acc1", {
+    // 备注名清空 = 合法（2026-10-11）：空串入库（= 没有备注名），站内显示回落邮箱地址。
+    // 以前这里是 400（「缺少备注名」），于是「不想起备注名」的用户只能拿邮箱当备注名。
+    const clearedName = await api("/accounts/acc1", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ displayName: "" }),
     });
-    expect(bad.status).toBe(400);
+    expect(clearedName.status).toBe(200);
+    expect(((await clearedName.json()) as { displayName: string }).displayName).toBe("");
+    expect(tc.ctx.accounts.get("acc1")?.displayName).toBe("");
+    expect(readAccounts(tc.dir).accounts.find((a) => a.id === "acc1")?.displayName).toBe("");
   });
 
   it("删除不存在的账号 404；删到只剩一个时 409", async () => {

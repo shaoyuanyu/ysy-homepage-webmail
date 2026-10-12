@@ -17,7 +17,10 @@ export function loadAccounts(dir: string = webmailDataDir()): {
     throw new Error("accounts.json 缺少 accounts 数组");
   }
   for (const a of raw.accounts) {
-    if (!a.id || !a.displayName || !a.email || !a.imapHost) {
+    // ⚠ `displayName` 允许**空串**（2026-10-11：没有备注名，站内显示退回邮箱地址）。
+    //   它是必需字段，但不必有内容：写成 `!a.displayName` 会让「没备注名」的账号在
+    //   webmaild 下次启动时直接抛错起不来（accounts.json 是 persistAccounts 写回的）。
+    if (!a.id || typeof a.displayName !== "string" || !a.email || !a.imapHost) {
       throw new Error(`accounts.json: 账号缺少必填字段（id/displayName/email/imapHost）`);
     }
     if (!Number.isInteger(a.imapPort) || typeof a.imapSecure !== "boolean") {

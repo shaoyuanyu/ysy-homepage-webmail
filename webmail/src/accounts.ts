@@ -168,12 +168,14 @@ export function normalizeAccountInput(
   existingIds: Set<string>,
   usedColors: Iterable<string> = []
 ): { account: WebmailAccount; cred: AccountCredential } {
-  const displayName = input.displayName?.trim();
+  /** 备注名可以为空（2026-10-11 用户要求：「有时我就希望账号以邮箱地址的形式显示」）：
+   *  空串 = 没有备注名，站内一律退回**邮箱地址**显示（前端 `accountName()`）。
+   *  ⚠ 与 `undefined` 的语义差别只体现在 PUT 上：`undefined` = 不改，空串 = 清掉备注名。 */
+  const displayName = input.displayName?.trim() ?? "";
   const email = input.email?.trim();
   const imapHost = input.imapHost?.trim();
   const smtpHost = input.smtpHost?.trim();
   const password = input.password ?? "";
-  if (!displayName) throw new AccountError("缺少显示名称");
   if (!email || !EMAIL_RE.test(email)) throw new AccountError("邮箱地址非法");
   if (!imapHost) throw new AccountError("缺少 IMAP 主机");
   if (!smtpHost) throw new AccountError("缺少 SMTP 主机");
@@ -484,7 +486,10 @@ export async function updateAccount(
   const cred = ctx.credentials.get(id);
   if (!cred) throw new AccountError(`账号 ${id} 缺少凭据`, 500);
 
-  const displayName = input.displayName !== undefined ? input.displayName.trim() : current.displayName;
+  // 备注名可空（2026-10-11，见 normalizeAccountInput）：`undefined` = 保持原值，
+  // 空串 = **主动清掉**备注名（站内显示回落邮箱地址）
+  const displayName =
+    input.displayName !== undefined ? input.displayName.trim() : current.displayName;
   const email = input.email !== undefined ? input.email.trim() : current.email;
   const imapHost = input.imapHost !== undefined ? input.imapHost.trim() : current.imapHost;
   const smtpHost = input.smtpHost !== undefined ? input.smtpHost.trim() : current.smtpHost;
@@ -492,7 +497,6 @@ export async function updateAccount(
   const smtpPort = input.smtpPort !== undefined ? input.smtpPort : current.smtpPort;
   const imapSecure = input.imapSecure !== undefined ? input.imapSecure : current.imapSecure;
   const smtpSecure = input.smtpSecure !== undefined ? input.smtpSecure : current.smtpSecure;
-  if (!displayName) throw new AccountError("缺少备注名");
   if (!email || !EMAIL_RE.test(email)) throw new AccountError("邮箱地址非法");
   if (!imapHost) throw new AccountError("缺少 IMAP 主机");
   if (!smtpHost) throw new AccountError("缺少 SMTP 主机");
