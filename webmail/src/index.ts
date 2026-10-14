@@ -12,12 +12,17 @@ import { purgeIndexedDrafts } from "./draft-store.js";
 const PORT = Number(process.env.WEBMAIL_PORT ?? 9710);
 /** 监听地址：缺省回环（本机信任边界）；容器/私有网络部署时由 WEBMAIL_HOST 覆盖（如 0.0.0.0） */
 const HOST = process.env.WEBMAIL_HOST ?? "127.0.0.1";
-const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 60_000);
+/**
+ * 同步轮间隔（缺省 5 秒）。⚠ 一轮的耗时通常超过这个间隔（标记回读在 QQ 上每个文件夹
+ * 约 2 秒，多账号多文件夹十几秒起步），`runSync` 的在飞保护会把间隔内触发的轮次
+ * 合并进正在跑的那一轮——实际形态是「一轮接一轮的连续同步」。
+ */
+const SYNC_INTERVAL_MS = Number(process.env.WEBMAIL_SYNC_INTERVAL_MS ?? 5_000);
 /**
  * 回填泵节拍（2026-10-08）：还有历史回填没做完时，用这个节拍驱动「一次一块」的
- * 回填轮（fetcher.ts 的 `mode: "backfill"`）。60s 的常规轮只吃一块，靠它才能把
- * 首轮铺满整个邮箱的时间压到十几分钟；而每块的账号锁持有只有几秒，
- * 期间 LIST / 发信 / 标记都能插进来。
+ * 回填轮（fetcher.ts 的 `mode: "backfill"`）。⚠ 全量轮连续跑时（间隔 5 秒 < 一轮
+ * 耗时）泵会被让路规则挡掉大半，回填实际由「每轮一块」推进——首轮铺满整个邮箱
+ * 仍在十几分钟的量级；而每块的账号锁持有只有几秒，期间 LIST / 发信 / 标记都能插进来。
  */
 const BACKFILL_TICK_MS = Number(process.env.WEBMAIL_BACKFILL_TICK_MS ?? 1500);
 /**
@@ -89,7 +94,7 @@ async function main() {
 
   // 历史回填泵（见文件头 BACKFILL_TICK_MS）：没有待回填的文件夹时几乎是空转
   // （一次 hasPendingBackfill 查询）；有活干时每拍吃一块，直到铺满。
-  // ⚠ 让路规则：全量轮在飞时跳过这一拍——否则回填轮会把 60s 常规轮（增量 + 标记
+  // ⚠ 让路规则：全量轮在飞时跳过这一拍——否则回填轮会把常规轮（增量 + 标记
   //   回读）一并顶掉（api.ts 的 runSync 语义 3）。
   const backfillTimer = setInterval(() => {
     if (isFullSyncInFlight()) return;

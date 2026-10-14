@@ -20,7 +20,7 @@ MAIL-AGENT.md 第八节第 2 步的后端部分（架构见文档 4.6）。独�
 | `src/backup.ts` | 邮件数据快照（4.15）：SQLite 在线备份 + `eml/` 硬链 + 凭据 600 + 保留 N 份；`tsx src/backup.ts` 可直接跑 |
 | `src/drafts.ts` / `src/draft-mirror.ts` | 服务端草稿（4.9）+ 镜像到账号服务商「草稿」文件夹（单向） |
 | `src/locks.ts` | 账号级 IMAP 互斥锁（红线 10）；同步 / 标记 / 移动 / 发信 / 草稿镜像共用 |
-| `src/index.ts` | 入口：启动同步一轮 + 60 秒定时轮询 + **1.5 秒回填泵**（有待回填的历史时才真干活，见 `mail/src/fetcher.ts` 的倒序分块回填）+ 草稿镜像扫描（4s）+ API 常驻 |
+| `src/index.ts` | 入口：启动同步一轮 + 5 秒定时轮询 + **1.5 秒回填泵**（有待回填的历史时才真干活，见 `mail/src/fetcher.ts` 的倒序分块回填）+ 草稿镜像扫描（4s）+ API 常驻 |
 
 ## 数据目录
 

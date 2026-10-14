@@ -1257,11 +1257,11 @@ let backfillInFlight: Promise<SyncRoundResult> | null = null;
  * 1. **单个账号失败不再中断整轮**（2026-10-07 修）。旧实现在 catch 里 rethrow：第一个坏账号
  *    会让后面的账号这一轮完全不抓（它一直坏 = 后面的账号永远排不上），且 /health 上其它
  *    账号的状态静默陈旧。现在按账号隔离，错误逐个记进 `errors` 与该账号的 `lastError`。
- * 2. **同一时刻只跑一轮全量**。60s 定时器与页面刷新的 `/sync` 会叠加，一轮超过 60s 时
+ * 2. **同一时刻只跑一轮全量**。定时器与页面刷新的 `/sync` 会叠加，一轮超过定时间隔时
  *    旧实现把新请求无界地排在账号锁后面。现在进行中的全量轮被复用（await 同一条
  *    promise）。指定 `accountId` 的同步不受此限（用户显式动作，且失败要抛给调用方）。
  * 3. **回填轮（`mode: "backfill"`）单独计数**（2026-10-08）：首轮历史回填由「回填泵」
- *    高频驱动（一次只吃一块，见 fetcher.ts），若与全量轮共用同一个在飞标记，60s 的常规轮
+ *    高频驱动（一次只吃一块，见 fetcher.ts），若与全量轮共用同一个在飞标记，常规轮
  *    会被泵的轮次顶掉——增量与标记回读就再也不跑了。故回填轮只在**没有全量轮**时开跑，
  *    且回填轮之间也不叠加。
  */
@@ -1320,7 +1320,7 @@ async function doRunSync(
       state.lastSync = now;
       state.lastError = null;
       // 本轮**收件箱里真的新到了信**才刷新 lastNewMail——「上次收到新邮件」的语义，
-      // 与「同步循环还活着」（lastSync，60s 一轮恒新鲜）分开（5.5）。两个条件缺一不可：
+      // 与「同步循环还活着」（lastSync，每轮都刷新）分开（5.5）。两个条件缺一不可：
       // 1. 只有收件箱算「收到邮件」：别的文件夹出现新副本全是我们自己写进去的（发信
       //    APPEND 到「已发送」、草稿镜像、「标为垃圾」搬进垃圾夹、搬到归档）；
       // 2. 那封不是用户刚刚自己搬进去的（见 noteUserMove）：「移出垃圾」「撤销标为垃圾」
@@ -1449,7 +1449,7 @@ export function createApiServer(
       if (req.method === "POST" && path === "/accounts") {
         const body = (await readBody(req)) as AddAccountInput;
         const summary = await addAccount(ctx, body);
-        // 立刻为该账号起一轮同步（不等待）：新账号的首封邮件不必等 60s 定时器，
+        // 立刻为该账号起一轮同步（不等待）：新账号的首封邮件不必等下一轮定时器，
         // 而且首轮是「最新优先」的倒序回填——几秒内列表里就有最近的邮件（2026-10-08）
         void runSync(ctx, summary.id).catch((err) =>
           console.error(`[webmaild] 新账号 ${summary.id} 首次同步失败：`, err)
@@ -1477,7 +1477,7 @@ export function createApiServer(
         const before = ctx.accounts.get(id);
         const summary = await updateAccount(ctx, id, body);
         // 同步文件夹白名单变了 → 立刻按新白名单跑一轮（新增的文件夹当场开始回填，
-        // 不必等 60s 定时器；2026-10-08）
+        // 不必等下一轮定时器；2026-10-08）
         const foldersChanged =
           !!before && before.folders.slice().sort().join("\u0000") !== summary.folders.slice().sort().join("\u0000");
         if (foldersChanged) {
