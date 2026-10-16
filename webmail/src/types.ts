@@ -28,6 +28,11 @@ export interface SendAttachment {
 
 export interface SendInput {
   accountId: string;
+  /**
+   * 临时发件人姓名（2026-10-16）：本封邮件专用的 From 显示名（写信页的「显示名」），
+   * 只作用于这一封——省缺 / 空串时回落到账号的 `senderName`（见 send.ts）。
+   */
+  fromName?: string;
   to: string[];
   cc?: string[];
   bcc?: string[];

@@ -557,6 +557,7 @@ describe("webmaild HTTP API", () => {
           to: "a@example.com",
           subject: "草稿一",
           body: "写了一半",
+          fromName: "Yu Shaoyuan",
           readReceipt: true,
           inReplyTo: "<w01@test.local>",
           references: ["<w01@test.local>"],
@@ -568,12 +569,15 @@ describe("webmaild HTTP API", () => {
       readReceipt: boolean;
       references: string[];
       kindRef: string;
+      fromName: string;
     };
     expect(created.id).toBeTruthy();
     expect(created.kind).toBe("reply");
     expect(created.kindRef).toBe("mid:w01@test.local");
     expect(created.readReceipt).toBe(true);
     expect(created.references).toEqual(["<w01@test.local>"]);
+    // 临时发件人姓名随草稿存（写信页「显示名」）
+    expect(created.fromName).toBe("Yu Shaoyuan");
 
     // 更新：只传部分字段，缺省 = 保持原值（整体替换语义）
     const updated = (await (
@@ -582,11 +586,12 @@ describe("webmaild HTTP API", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ subject: "草稿一（改）", to: "a@example.com, b@example.com" }),
       })
-    ).json()) as { subject: string; to: string; readReceipt: boolean; kind: string };
+    ).json()) as { subject: string; to: string; readReceipt: boolean; kind: string; fromName: string };
     expect(updated.subject).toBe("草稿一（改）");
     expect(updated.to).toBe("a@example.com, b@example.com");
     expect(updated.readReceipt).toBe(true);
     expect(updated.kind).toBe("reply");
+    expect(updated.fromName).toBe("Yu Shaoyuan");
 
     // 第二封 → 列表按最近更新倒序（新的在前）
     const second = (await (

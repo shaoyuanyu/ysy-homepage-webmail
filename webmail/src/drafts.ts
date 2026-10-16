@@ -17,6 +17,11 @@ export interface Draft {
   kind: "new" | "reply" | "forward";
   kindRef: string;
   accountId: string;
+  /**
+   * 临时发件人姓名（2026-10-16 用户要求）：本封邮件专用的发件人自称，**不改账号设置**。
+   * 空串 = 用账号自己的 `senderName`（回落判定只在 `send.ts` / `draft-mirror.ts` 两处写）。
+   */
+  fromName: string;
   to: string;
   cc: string;
   bcc: string;
@@ -43,6 +48,7 @@ export interface DraftInput {
   kind?: string;
   kindRef?: string;
   accountId?: string;
+  fromName?: string;
   to?: string;
   cc?: string;
   bcc?: string;
@@ -58,6 +64,7 @@ interface DraftRow {
   kind: string;
   kind_ref: string;
   account_id: string;
+  from_name: string;
   to_text: string;
   cc_text: string;
   bcc_text: string;
@@ -82,6 +89,7 @@ function toDraft(row: DraftRow): Draft {
     kind: (KINDS.has(row.kind) ? row.kind : "new") as Draft["kind"],
     kindRef: row.kind_ref,
     accountId: row.account_id,
+    fromName: row.from_name,
     to: row.to_text,
     cc: row.cc_text,
     bcc: row.bcc_text,
@@ -151,6 +159,7 @@ export function createDraft(db: Db, input: DraftInput): Draft {
     kind: (KINDS.has(str(input.kind)) ? str(input.kind) : "new") as Draft["kind"],
     kindRef: str(input.kindRef),
     accountId: str(input.accountId),
+    fromName: str(input.fromName),
     to: str(input.to),
     cc: str(input.cc),
     bcc: str(input.bcc),
@@ -167,14 +176,15 @@ export function createDraft(db: Db, input: DraftInput): Draft {
     attachments: [],
   };
   db.prepare(
-    `INSERT INTO drafts (id, kind, kind_ref, account_id, to_text, cc_text, bcc_text,
+    `INSERT INTO drafts (id, kind, kind_ref, account_id, from_name, to_text, cc_text, bcc_text,
        subject, body, read_receipt, in_reply_to, references_json, created_at, updated_at, server_dirty)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
   ).run(
     draft.id,
     draft.kind,
     draft.kindRef,
     draft.accountId,
+    draft.fromName,
     draft.to,
     draft.cc,
     draft.bcc,
@@ -198,6 +208,7 @@ export function updateDraft(db: Db, id: string, input: DraftInput): Draft | null
     kind: KINDS.has(str(input.kind)) ? (str(input.kind) as Draft["kind"]) : existing.kind,
     kindRef: input.kindRef !== undefined ? str(input.kindRef) : existing.kindRef,
     accountId: input.accountId !== undefined ? str(input.accountId) : existing.accountId,
+    fromName: input.fromName !== undefined ? str(input.fromName) : existing.fromName,
     to: input.to !== undefined ? str(input.to) : existing.to,
     cc: input.cc !== undefined ? str(input.cc) : existing.cc,
     bcc: input.bcc !== undefined ? str(input.bcc) : existing.bcc,
@@ -211,13 +222,14 @@ export function updateDraft(db: Db, id: string, input: DraftInput): Draft | null
     updatedAt: new Date().toISOString(),
   };
   db.prepare(
-    `UPDATE drafts SET kind = ?, kind_ref = ?, account_id = ?, to_text = ?, cc_text = ?,
+    `UPDATE drafts SET kind = ?, kind_ref = ?, account_id = ?, from_name = ?, to_text = ?, cc_text = ?,
        bcc_text = ?, subject = ?, body = ?, read_receipt = ?, in_reply_to = ?,
        references_json = ?, updated_at = ?, server_dirty = 1 WHERE id = ?`
   ).run(
     next.kind,
     next.kindRef,
     next.accountId,
+    next.fromName,
     next.to,
     next.cc,
     next.bcc,

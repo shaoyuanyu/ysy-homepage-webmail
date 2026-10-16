@@ -122,6 +122,10 @@ function migrate(db: Db): void {
       kind TEXT NOT NULL DEFAULT 'new',
       kind_ref TEXT NOT NULL DEFAULT '',
       account_id TEXT NOT NULL DEFAULT '',
+      -- 临时发件人姓名（2026-10-16，写信页「显示名」）：本封邮件专用的署名，空 = 用
+      -- 账号自己的 senderName（回落逻辑在 webmail 的 send.ts / draft-mirror.ts）。
+      -- 它不是账号级设置，只活在草稿与这一封发出邮件里。
+      from_name TEXT NOT NULL DEFAULT '',
       to_text TEXT NOT NULL DEFAULT '',
       cc_text TEXT NOT NULL DEFAULT '',
       bcc_text TEXT NOT NULL DEFAULT '',
@@ -173,6 +177,8 @@ function migrate(db: Db): void {
   // 或已经按需解析过的服务器草稿），标成已读即可。**未解析的服务器草稿 body 为空**，不受影响。
   db.exec("UPDATE drafts SET server_parsed = 1 WHERE server_parsed = 0 AND body <> ''");
   addColumnIfMissing(db, "drafts", "attachments_json", "attachments_json TEXT NOT NULL DEFAULT '[]'");
+  // 临时发件人姓名（2026-10-16）：存量草稿默认空串 = 用账号自己的 senderName，与旧行为一致
+  addColumnIfMissing(db, "drafts", "from_name", "from_name TEXT NOT NULL DEFAULT ''");
   if (addedServerDirty) {
     // 存量草稿一次性标记待投递：它们建于镜像功能上线前，阿里云网页端还看不到
     // （只在本分支执行——全新库的 CREATE TABLE 已带该列，不会走到这里）

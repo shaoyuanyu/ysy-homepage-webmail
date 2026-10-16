@@ -173,6 +173,69 @@ describe("webmaild 发信", () => {
       expect(parsed2.from?.value[0]?.name).toBe("");
       expect(parsed2.from?.value[0]?.address).toBe("test@local");
     });
+
+    it("临时发件人姓名（fromName）：本封用它、账号设置不动；空串回落账号的 senderName", async () => {
+      // 上一个用例把账号的发件人姓名清空了，先设回来
+      await fetch(`${base}/accounts/acc1`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ senderName: "Shaoyuan Yu" }),
+      });
+
+      // ① 带临时署名发送 → From 用临时的那个
+      const before = sink.received.length;
+      const res = await fetch(`${base}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: "acc1",
+          fromName: "Yu Shaoyuan (课题组)",
+          to: ["boss@example.org"],
+          subject: "临时署名",
+          text: "x",
+        }),
+      });
+      expect(res.status).toBe(200);
+      const parsed = await simpleParser(sink.received[before]);
+      expect(parsed.from?.value[0]?.name).toBe("Yu Shaoyuan (课题组)");
+      expect(parsed.from?.value[0]?.address).toBe("test@local");
+      // 账号级发件人姓名不受影响（临时署名绝不写回账号）
+      const accounts = (await (await fetch(`${base}/accounts`)).json()) as {
+        id: string;
+        senderName: string;
+      }[];
+      expect(accounts.find((a) => a.id === "acc1")?.senderName).toBe("Shaoyuan Yu");
+
+      // ② 空 / 全空格 = 没给临时署名 → 回落账号的 senderName（不是"无名字"）
+      const before2 = sink.received.length;
+      await fetch(`${base}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: "acc1",
+          fromName: "   ",
+          to: ["boss2@example.org"],
+          subject: "空白署名",
+          text: "y",
+        }),
+      });
+      expect((await simpleParser(sink.received[before2])).from?.value[0]?.name).toBe("Shaoyuan Yu");
+
+      // ③ 名字里的引号被剔掉（不会撑破 From 头的引号包裹）
+      const before3 = sink.received.length;
+      await fetch(`${base}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: "acc1",
+          fromName: 'a"b',
+          to: ["boss3@example.org"],
+          subject: "带引号",
+          text: "z",
+        }),
+      });
+      expect((await simpleParser(sink.received[before3])).from?.value[0]?.name).toBe("ab");
+    });
   });
 
   describe("找不到「已发送」文件夹", () => {

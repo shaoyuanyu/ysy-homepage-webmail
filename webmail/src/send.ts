@@ -9,6 +9,20 @@ import { appendRaw, detectSentFolder } from "./write.js";
 
 const ADDRESS_RE = /^[^\s@,;<>]+@[^\s@,;<>]+$/;
 
+/**
+ * From 头的值（2026-10-16 起单点判定）。
+ *
+ * 显示名的优先级在**调用处**给（`临时署名 || 账号 senderName`），这里只管形态：
+ * 有名字 = `"名字" <地址>`，没名字 = 只发地址。与 `draft-mirror.ts` 的草稿 From 同一格式
+ * （那边的调用处用 `row.from_name || account.senderName`）。
+ */
+export function formatFrom(email: string, name?: string): string {
+  // 引号 / 换行会破坏 From 头的引号包裹（也堵住自造头的注入面）：一律去掉。
+  // 中文、空格、标点都留着——那些由 MailComposer 做 MIME 编码。
+  const clean = name?.replace(/["\r\n]/g, "").trim();
+  return clean ? `"${clean}" <${email}>` : email;
+}
+
 function assertAddresses(label: string, list: string[]): void {
   for (const addr of list) {
     if (!ADDRESS_RE.test(addr.trim())) {
@@ -39,10 +53,11 @@ export async function sendMessage(
   const messageId = `<${Date.now()}.${randomBytes(12).toString("hex")}@${domain}>`;
 
   const composer = new MailComposer({
-    // From 的显示名用 senderName（发件人姓名，随邮件对外）——**不是** displayName
+    // From 的显示名：**临时署名（`fromName`，写信页本封专用的「显示名」）优先**，
+    // 其次才是账号的 senderName（发件人姓名，随邮件对外）——**不是** displayName
     // （本地备注名，仅站内 UI 用；2026-10-06 用户报障：备注名「我」被当成发件人姓名
-    // 发出）。senderName 为空 = From 只有邮箱地址，不带名字。
-    from: account.senderName ? `"${account.senderName}" <${account.email}>` : account.email,
+    // 发出）。两者都为空 = From 只有邮箱地址，不带名字。
+    from: formatFrom(account.email, (input.fromName ?? "").trim() || account.senderName),
     to: input.to.join(", "),
     cc: input.cc?.join(", "),
     bcc: input.bcc?.join(", "),

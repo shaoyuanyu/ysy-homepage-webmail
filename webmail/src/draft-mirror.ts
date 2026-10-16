@@ -6,6 +6,7 @@ import { connectAccount } from "../../mail/src/imap.js";
 import type { WebmailContext } from "./api.js";
 import { withAccountLock } from "./locks.js";
 import { acquireConnection, releaseConnection } from "./pool.js";
+import { formatFrom } from "./send.js";
 import type { WebmailAccount } from "./types.js";
 import { detectDraftsFolder } from "./write.js";
 
@@ -51,6 +52,8 @@ interface MirrorRow {
   kind: string;
   kind_ref: string;
   account_id: string;
+  /** 临时发件人姓名（写信页「显示名」，2026-10-16）：非空时就是草稿的 From 显示名 */
+  from_name: string;
   to_text: string;
   cc_text: string;
   bcc_text: string;
@@ -104,7 +107,8 @@ export function readDraftServerRef(db: Db, id: string): DraftServerRef | null {
  * - Message-ID 用 `draft-<草稿 id>@域名`（确定性、可追溯；同一草稿的历代版本共用）
  * - 地址串按用户输入的原文传入（草稿是半成品，不做发送侧的合法性拦截——校验
  *   留给发送；地址解析由 MailComposer 承担）
- * - From 显示名用 senderName（与发送路径同一规则，见 send.ts）
+ * - From 显示名：**草稿上的临时署名（`from_name`）优先**，否则账号的 senderName
+ *   （与发送路径同一回落规则，见 send.ts 的 formatFrom）
  */
 async function buildDraftRaw(
   account: WebmailAccount,
@@ -122,7 +126,7 @@ async function buildDraftRaw(
     if (row.kind_ref) headers["X-Webmail-Draft-Ref"] = row.kind_ref;
   }
   const composer = new MailComposer({
-    from: account.senderName ? `"${account.senderName}" <${account.email}>` : account.email,
+    from: formatFrom(account.email, row.from_name || account.senderName),
     to: row.to_text || undefined,
     cc: row.cc_text || undefined,
     bcc: row.bcc_text || undefined,
