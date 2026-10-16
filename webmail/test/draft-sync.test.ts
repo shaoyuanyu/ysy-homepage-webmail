@@ -104,6 +104,47 @@ describe("webmaild 草稿镜像（本地 → 服务器草稿箱）", () => {
     await api(`/drafts/${created.id}`, { method: "DELETE" });
   });
 
+  /**
+   * 还没有归属账号的草稿（2026-10-17）：写信页入口没带账号时**不预选发件人**，用户在
+   * 这段时间里打的字照样自动保存 —— 那种草稿 `accountId` 是空串（HTTP 侧合法）。
+   *
+   * ⚠ 它**不该**落到 `mirrorOne` 的「账号未配置：」throw 上：那条是给**真故障**（账号被
+   *   删 / 注册表配错）用的，而扫描是 4 秒一轮 + 内存退避，刷屏会把真故障淹掉。契约 =
+   *   安静跳过、留 dirty（不是"已完成"，是"暂时没地方投"），用户选好发件人后的下一次
+   *   保存带上归属，下一轮自然投出去。
+   */
+  it("没有归属账号的草稿：安静跳过（不报错、不投递、留 dirty），补上账号后自愈", async () => {
+    const created = (await (
+      await api("/drafts", {
+        method: "POST",
+        body: JSON.stringify({ to: "nobody@example.org", subject: "还没选发件人", body: "半截" }),
+      })
+    ).json()) as { id: string; accountId: string };
+    expect(created.accountId, "没传 accountId = 空串（不是 null/undefined）").toBe("");
+
+    const r = await mirrorDrafts(tc.ctx, { quietMs: 0 });
+    expect(r, "既不算投递成功、也不算失败").toEqual({ mirrored: 0, failed: 0 });
+    expect(await serverDrafts()).toHaveLength(0);
+    const row = tc.ctx.db
+      .prepare("SELECT server_dirty FROM drafts WHERE id = ?")
+      .get(created.id) as { server_dirty: number } | undefined;
+    expect(row?.server_dirty, "只是没地方投，不是完成了").toBe(1);
+
+    // 选好发件人 → 保存带上归属 → 这一轮就投出去
+    const put = await api(`/drafts/${created.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ accountId: "acc1" }),
+    });
+    expect(put.status).toBe(200);
+    const r2 = await mirrorDrafts(tc.ctx, { quietMs: 0 });
+    expect(r2).toEqual({ mirrored: 1, failed: 0 });
+    const drafts = await serverDrafts();
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].subject).toBe("还没选发件人");
+
+    await api(`/drafts/${created.id}`, { method: "DELETE" });
+  });
+
   it("新建草稿 → 投递到服务器草稿箱（\\Draft 标记、主题与正文正确）", async () => {
     const created = (await (
       await api("/drafts", {

@@ -278,6 +278,12 @@ async function doMirrorDrafts(
   let failed = 0;
   for (const row of rows) {
     if (skipDueToBackoff(row.id)) continue;
+    // ⚠ 还没有归属账号的草稿（写信页 2026-10-17 起「全部账号」入口**不预选发件人**）：草稿
+    //   要投到**某个账号**的服务商「草稿」文件夹，没归属就没地方投 —— 安静跳过（留 dirty，
+    //   用户选好发件人后的下一次自动保存会带上 account_id，下一轮自然投出去）。
+    //   ⚠ 别让它落到下面 mirrorOne 的「账号未配置」throw：那条是给**真故障**（账号被删 /
+    //   注册表配错）用的，按 4 秒一轮 + 退避反复刷日志会把真故障淹掉。
+    if (!row.account_id) continue;
     try {
       await mirrorOne(ctx, row);
       backoff.delete(row.id);
