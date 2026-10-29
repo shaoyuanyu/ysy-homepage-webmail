@@ -145,6 +145,11 @@ async function buildDraftRaw(
           }))
         : undefined,
     messageId: `<draft-${row.id}@${domain}>`,
+    // Date 头用草稿自己的最后保存时间（2026-10-29）。默认值 = **投递那一刻**：
+    // 一旦批量补投 / 重建草稿，这些草稿在服务商网页端和手机端会全部显示成「刚刚」，
+    // 把草稿列表的排序整个打乱；而 `upsertEnvelopes` 又拿 envelope 的 Date 回写本地
+    // `updated_at`，两边一起错。解不出时间就不传，退回 nodemailer 的默认行为。
+    date: Number.isNaN(Date.parse(row.updated_at)) ? undefined : new Date(row.updated_at),
   });
   return composer.compile().build();
 }

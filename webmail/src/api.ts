@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { simpleParser } from "mailparser";
+import sanitizeHtml from "sanitize-html";
 import type { Db } from "../../mail/src/db.js";
 import { connectAccount } from "../../mail/src/imap.js";
 import { headerValue, INTERNAL_KEY_HEADER, internalKeyMatches } from "../../mail/src/internal-key.js";
@@ -35,7 +37,7 @@ import { withAccountLock } from "./locks.js";
 import { acquireConnection, releaseConnection } from "./pool.js";
 import { renderMailHtml } from "./render.js";
 import { sendMessage } from "./send.js";
-import { applyFlagChange, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, openReadWrite, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
+import { applyFlagChange, copyUid, deleteUid, isSentFolderName, JUNK_FOLDER_NAMES, moveUid, openReadWrite, purgeUid, resolveMoveTarget, SENT_FOLDER_NAMES, setFlags, setFlagsBatch, setSeenBatch, specialMoveTargetLabel } from "./write.js";
 
 /** 前端代理前缀：cid 内联附件重写到这个前缀下（webmaild 自身只绑回环） */
 const PUBLIC_PREFIX = process.env.WEBMAIL_PUBLIC_PREFIX ?? "/api/mail";
@@ -1073,7 +1075,7 @@ function copyMessageId(db: Db, c: CopyRef): string | undefined {
 async function applyCopiesOp(
   ctx: WebmailContext,
   copies: CopyRef[],
-  op: "move" | "delete",
+  op: "move" | "delete" | "purge",
   dest?: string
 ) {
   const byAccount = new Map<string, CopyRef[]>();
@@ -1111,12 +1113,25 @@ async function applyCopiesOp(
             // 已经在目标文件夹里：不发多余的 MOVE。特殊用途记号的解析结果只有服务端知道，
             // 前端无从预判，故这道兜底必须在服务端（本地行照旧不动——信确实还在那儿）。
             if (c.folder === target) continue;
-            await moveUid(client, c.folder, c.uid, target!);
+            try {
+              await moveUid(client, c.folder, c.uid, target!);
+            } catch (err) {
+              // 服务商明确拒绝 MOVE（QQ / 阿里云在 JUNK↔INBOX / JUNK↔Deleted Messages
+              // 上实测过）：退回到标准 COPY + 硬删源副本。
+              console.warn(
+                `[webmaild] MOVE 失败，退回 COPY + EXPUNGE：${c.folder}#${c.uid} → ${target}`,
+                err instanceof Error ? err.message : err
+              );
+              await copyUid(client, c.folder, c.uid, target!);
+              await purgeUid(client, c.folder, c.uid);
+            }
             // 这封是用户自己搬的（见 noteUserMove）：目标文件夹给它配的是新 UID，同步器
             // 在增量里会当成刚到的新邮件。必须在账号锁内、搬完立刻写——锁一放，等着的那
             // 一轮同步就会先去扫目标文件夹；库键用搬动前的源副本行查。
             const movedId = copyMessageId(ctx.db, c);
             if (movedId) noteUserMove(ctx.db, movedId);
+          } else if (op === "purge") {
+            await purgeUid(client, c.folder, c.uid);
           } else {
             await deleteUid(client, c.folder, c.uid);
           }
@@ -1239,6 +1254,230 @@ async function undoJunkMove(
   return { restored, skipped };
 }
 
+/**
+ * 服务商默认签名导入（2026-10-29 用户提案的落地方案）。
+ *
+ * 背景：企业邮箱 / 网页端的「默认签名」没有 IMAP/SMTP 标准接口可读。用户的做法：
+ * 用该账号的网页端给自己发一封邮件，服务商会在发送时自动附上默认签名；这封信会
+ * 同步进 INBOX，我们从中把**签名正文**读出来。
+ *
+ * 安全边界：
+ * - 主题必须同时包含固定标记 `[webmail-signature]` 与**客户端生成的随机校验码**；
+ * - 只接受 **15 分钟内**收到的邮件；
+ * - 发件人必须是**该账号自己**（否则不认，避免把别人的签名导入到你的账号）；
+ * - 接口本身在站点代理层有 owner 保护（普通游客拿不到）。
+ *
+ * 返回 `found:false` 属于正常业务结果（还没收到 / 码不匹配 / 发件人不对）；
+ * 客户端据此提示用户稍后重试。
+ */
+const SIGNATURE_CODE_RE = /^[A-Z0-9-]{6,40}$/;
+const SIGNATURE_IMPORT_WINDOW_MS = 15 * 60 * 1000;
+
+interface SignatureImportResult {
+  found: boolean;
+  signature?: string;
+  /** 服务商签名的 HTML（含图片）；前端优先用它转 Markdown，保留 logo */
+  html?: string;
+  reason?: "not_found" | "from_mismatch" | "empty" | "no_source" | "sync_failed";
+  subject?: string | null;
+  from?: string | null;
+  date?: string;
+  syncError?: string;
+}
+
+/** 可落的图片类型 → 扩展名（只接受光栅图；SVG 可带脚本，不落盘） */
+function signatureImageExt(contentType: string): string | null {
+  const t = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (t === "image/png") return "png";
+  if (t === "image/jpeg" || t === "image/jpg") return "jpg";
+  if (t === "image/gif") return "gif";
+  if (t === "image/webp") return "webp";
+  return null;
+}
+
+/** 把一张签名图片写到 data/signature-assets，返回站内公开路径（前端会补上 origin） */
+function saveSignatureAsset(ctx: WebmailContext, content: Buffer, contentType: string): string | null {
+  const ext = signatureImageExt(contentType);
+  if (!ext) return null;
+  const dir = join(ctx.dataDir, "signature-assets");
+  mkdirSync(dir, { recursive: true });
+  const file = `${randomBytes(16).toString("hex")}.${ext}`;
+  writeFileSync(join(dir, file), content);
+  // 公开路由（不经 owner 守卫）：邮件收件人必须能直接加载这张图
+  return `/api/mail-signature-asset/${file}`;
+}
+
+/** cid: / data: 图片 → 站内公开资源；远程图保留；解析不了的删掉整个 img */
+function rewriteSignatureImages(
+  html: string,
+  cidMap: Map<string, { content: Buffer; contentType: string }>,
+  ctx: WebmailContext
+): string {
+  return html.replace(/<img\b[^>]*>/gi, (tag) => {
+    const m = tag.match(/\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    if (!m) return tag;
+    const src = m[1] ?? m[2] ?? m[3] ?? "";
+    let next: string | null = null;
+    if (/^cid:/i.test(src)) {
+      const att = cidMap.get(normCid(src.slice(4)));
+      if (att) next = saveSignatureAsset(ctx, att.content, att.contentType);
+    } else if (/^data:/i.test(src)) {
+      const data = src.match(/^data:([^;]+);base64,(.*)$/i);
+      if (data) next = saveSignatureAsset(ctx, Buffer.from(data[2], "base64"), data[1]);
+    }
+    if (/^(cid:|data:)/i.test(src)) {
+      // 内嵌图：换成站内 URL；不支持的格式（如 SVG）直接丢掉，避免破图
+      return next ? tag.replace(m[0], `src="${next}"`) : "";
+    }
+    return tag; // 远程图片 / 站内相对路径原样保留
+  });
+}
+
+/** 签名 HTML 白名单：只留排版与图片，不给脚本 / 样式 / 事件句柄可乘之机 */
+function sanitizeSignatureHtml(html: string): string {
+  return sanitizeHtml(html, {
+    allowedTags: [
+      "p", "br", "div", "span", "strong", "b", "em", "i", "u", "s", "a", "img",
+      "ul", "ol", "li", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6",
+      "table", "thead", "tbody", "tr", "td", "th", "hr",
+    ],
+    allowedAttributes: {
+      a: ["href", "title"],
+      img: ["src", "alt", "width", "height"],
+    },
+    allowedSchemes: ["http", "https", "mailto"],
+    disallowedTagsMode: "discard",
+  });
+}
+
+async function importProviderSignature(
+  ctx: WebmailContext,
+  accountId: string,
+  rawCode: string
+): Promise<SignatureImportResult> {
+  const account = ctx.accounts.get(accountId);
+  if (!account) throw new Error(`账号未配置：${accountId}`);
+  const code = rawCode.trim().toUpperCase();
+  if (!SIGNATURE_CODE_RE.test(code)) throw new Error("校验码格式不正确");
+
+  // 用户刚发完信：先拉一次这个账号，但同步失败不阻断（本地缓存里可能已经有）
+  let syncError: string | undefined;
+  try {
+    await runSync(ctx, accountId);
+  } catch (err) {
+    syncError = err instanceof Error ? err.message : String(err);
+  }
+
+  const cutoff = new Date(Date.now() - SIGNATURE_IMPORT_WINDOW_MS).toISOString();
+  const row = ctx.db
+    .prepare(
+      `SELECT m.message_id, m.subject, m.from_addr, m.date, m.eml_path
+       FROM messages m JOIN copies c ON c.message_id = m.message_id
+       WHERE c.account_id = ? AND upper(c.folder) = 'INBOX'
+         AND m.date >= ? AND m.subject LIKE '%webmail-signature%'
+         AND m.subject LIKE ?
+       ORDER BY m.date DESC LIMIT 1`
+    )
+    .get(accountId, cutoff, `%${code}%`) as
+    | {
+        message_id: string;
+        subject: string | null;
+        from_addr: string | null;
+        date: string;
+        eml_path: string | null;
+      }
+    | undefined;
+  if (!row) {
+    return { found: false, reason: syncError ? "sync_failed" : "not_found", syncError };
+  }
+  if ((row.from_addr ?? "").toLowerCase() !== account.email.toLowerCase()) {
+    return {
+      found: false,
+      reason: "from_mismatch",
+      subject: row.subject,
+      from: row.from_addr,
+      date: row.date,
+    };
+  }
+
+  let emlPath = row.eml_path;
+  if (!emlPath) {
+    try {
+      await fetchTruncatedSource(ctx, row.message_id);
+      emlPath = messageOf(ctx, row.message_id)?.eml_path ?? null;
+    } catch {
+      emlPath = null;
+    }
+  }
+  if (!emlPath) {
+    return {
+      found: false,
+      reason: "no_source",
+      subject: row.subject,
+      from: row.from_addr,
+      date: row.date,
+    };
+  }
+
+  let text = "";
+  let html = "";
+  try {
+    // keepCidLinks：保留 <img src="cid:…">，下面才能把内嵌 logo 落盘
+    const parsed = await simpleParser(readFileSync(join(ctx.dataDir, emlPath)), {
+      keepCidLinks: true,
+    });
+    text = (parsed.text ?? "").trim();
+    if (parsed.html) {
+      // 内嵌图（cid:）先落盘成站内公开资源；远程图保留；不能落的（SVG 等）直接用掉
+      const cidMap = new Map<string, { content: Buffer; contentType: string }>();
+      for (const att of parsed.attachments) {
+        if (att.cid) cidMap.set(normCid(att.cid), { content: att.content, contentType: att.contentType });
+      }
+      html = sanitizeSignatureHtml(
+        rewriteSignatureImages(String(parsed.html), cidMap, ctx)
+      ).slice(0, 200_000);
+    }
+    if (!text && html) {
+      // 纯 HTML 签名：去标签前把块级元素换成换行，至少保留分行
+      text = sanitizeHtml(
+        html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|h[1-6]|li|tr|blockquote)>/gi, "\n"),
+        { allowedTags: [], allowedAttributes: {} }
+      ).trim();
+    }
+  } catch {
+    return { found: false, reason: "no_source", subject: row.subject, from: row.from_addr, date: row.date };
+  }
+
+  const signature = text
+    .split(/\r?\n/)
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return true;
+      if (t.includes(code)) return false;
+      if (/^\[webmail-signature\]/i.test(t)) return false;
+      if (/^(签名导入|导入签名|signature import)$/i.test(t)) return false;
+      // 标准签名分隔线（`-- ` / `--`）不是签名内容；有的客户端会把它一起发过来
+      if (t === "--" || t === "-- ") return false;
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!signature && !html) {
+    return { found: false, reason: "empty", subject: row.subject, from: row.from_addr, date: row.date };
+  }
+  return {
+    found: true,
+    // 与偏好注册表的上限一致（5000 字符）
+    signature: signature.slice(0, 5000),
+    // 前端优先把 html 转 Markdown（保留图片/链接/粗体）；文本作为兜底
+    ...(html ? { html } : {}),
+    subject: row.subject,
+    from: row.from_addr,
+    date: row.date,
+  };
+}
+
 /** 一轮同步的结果：成功结果与逐账号错误分开收集 */
 export interface SyncRoundResult {
   results: unknown[];
@@ -1299,63 +1538,74 @@ async function doRunSync(
   opts: SyncOptions = {}
 ): Promise<SyncRoundResult> {
   const out: SyncRoundResult = { results: [], errors: [] };
-  for (const account of ctx.accounts.values()) {
-    if (!account.enabled) continue;
-    if (onlyAccount && account.id !== onlyAccount) continue;
-    const cred = ctx.credentials.get(account.id);
-    const state: SyncState = ctx.syncStates.get(account.id) ?? { lastSync: null, lastError: null, lastNewMail: null };
-    if (!cred) {
-      const message = `账号 ${account.id} 缺少凭据`;
-      state.lastError = message;
-      ctx.syncStates.set(account.id, state);
-      out.errors.push({ accountId: account.id, error: message });
-      console.error(`[webmaild] ${message}`);
-      continue;
-    }
-    try {
-      const r = await withAccountLock(account.id, () =>
-        syncAccount(ctx.db, ctx.dataDir, account, cred, undefined, opts)
-      );
-      const now = new Date().toISOString();
-      state.lastSync = now;
-      state.lastError = null;
-      // 本轮**收件箱里真的新到了信**才刷新 lastNewMail——「上次收到新邮件」的语义，
-      // 与「同步循环还活着」（lastSync，每轮都刷新）分开（5.5）。两个条件缺一不可：
-      // 1. 只有收件箱算「收到邮件」：别的文件夹出现新副本全是我们自己写进去的（发信
-      //    APPEND 到「已发送」、草稿镜像、「标为垃圾」搬进垃圾夹、搬到归档）；
-      // 2. 那封不是用户刚刚自己搬进去的（见 noteUserMove）：「移出垃圾」「撤销标为垃圾」
-      //    把信搬回收件箱，服务端给它配的是新 UID，与刚到的新信无从区分。
-      // ⚠ 历史回填的旧邮件不算（`ingested` 只含增量）：否则首轮每抓一块都会把前端
-      //   提醒刷成「收到 N 封新邮件」，几百封旧信被当成刚到的。
-      if (
-        r.some(
-          (x) =>
-            isInboxFolder(x.folder) &&
-            x.ingested.some((m) => !isUserMove(ctx.db, m.messageId))
-        )
-      ) {
-        state.lastNewMail = now;
+  /**
+   * 账号之间**并行**同步（2026-10-29 用户要求：刷新/定时同步不要串行）。
+   *
+   * 一个账号一轮的耗时主要是等 IMAP 往返（单账号 2 秒起、多账号串行十几秒），
+   * 账号之间没有任何共享状态；`withAccountLock` 保证**同一账号**不会并发，
+   * SQLite（better-sqlite3）是同步写、天然串行，所以跨账号并行是安全的。
+   * 指定 `onlyAccount` 时数组里只有一项，行为不变。
+   */
+  const accounts = [...ctx.accounts.values()].filter(
+    (account) => account.enabled && (!onlyAccount || account.id === onlyAccount)
+  );
+  await Promise.all(
+    accounts.map(async (account) => {
+      const cred = ctx.credentials.get(account.id);
+      const state: SyncState = ctx.syncStates.get(account.id) ?? { lastSync: null, lastError: null, lastNewMail: null };
+      if (!cred) {
+        const message = `账号 ${account.id} 缺少凭据`;
+        state.lastError = message;
+        ctx.syncStates.set(account.id, state);
+        out.errors.push({ accountId: account.id, error: message });
+        console.error(`[webmaild] ${message}`);
+        return;
       }
-      // 进程重启后内存态丢失：用库里最新一封的日期兜底初始化，
-      // 否则重启后要干等下一封新邮件才显示得出时间
-      if (!state.lastNewMail) {
-        const row = ctx.db
-          .prepare(
-            "SELECT MAX(m.date) AS d FROM messages m JOIN copies c ON c.message_id = m.message_id WHERE c.account_id = ?"
+      try {
+        const r = await withAccountLock(account.id, () =>
+          syncAccount(ctx.db, ctx.dataDir, account, cred, undefined, opts)
+        );
+        const now = new Date().toISOString();
+        state.lastSync = now;
+        state.lastError = null;
+        // 本轮**收件箱里真的新到了信**才刷新 lastNewMail——「上次收到新邮件」的语义，
+        // 与「同步循环还活着」（lastSync，每轮都刷新）分开（5.5）。两个条件缺一不可：
+        // 1. 只有收件箱算「收到邮件」：别的文件夹出现新副本全是我们自己写进去的（发信
+        //    APPEND 到「已发送」、草稿镜像、「标为垃圾」搬进垃圾夹、搬到归档）；
+        // 2. 那封不是用户刚刚自己搬进去的（见 noteUserMove）：「移出垃圾」「撤销标为垃圾」
+        //    把信搬回收件箱，服务端给它配的是新 UID，与刚到的新信无从区分。
+        // ⚠ 历史回填的旧邮件不算（`ingested` 只含增量）：否则首轮每抓一块都会把前端
+        //   提醒刷成「收到 N 封新邮件」，几百封旧信被当成刚到的。
+        if (
+          r.some(
+            (x) =>
+              isInboxFolder(x.folder) &&
+              x.ingested.some((m) => !isUserMove(ctx.db, m.messageId))
           )
-          .get(account.id) as { d: string | null };
-        state.lastNewMail = row.d ?? null;
+        ) {
+          state.lastNewMail = now;
+        }
+        // 进程重启后内存态丢失：用库里最新一封的日期兜底初始化，
+        // 否则重启后要干等下一封新邮件才显示得出时间
+        if (!state.lastNewMail) {
+          const row = ctx.db
+            .prepare(
+              "SELECT MAX(m.date) AS d FROM messages m JOIN copies c ON c.message_id = m.message_id WHERE c.account_id = ?"
+            )
+            .get(account.id) as { d: string | null };
+          state.lastNewMail = row.d ?? null;
+        }
+        out.results.push(r);
+      } catch (err) {
+        state.lastError = err instanceof Error ? err.message : String(err);
+        ctx.syncStates.set(account.id, state);
+        out.errors.push({ accountId: account.id, error: state.lastError });
+        console.error(`[webmaild] 账号 ${account.id} 同步失败：`, state.lastError);
+        return;
       }
-      out.results.push(r);
-    } catch (err) {
-      state.lastError = err instanceof Error ? err.message : String(err);
       ctx.syncStates.set(account.id, state);
-      out.errors.push({ accountId: account.id, error: state.lastError });
-      console.error(`[webmaild] 账号 ${account.id} 同步失败：`, state.lastError);
-      continue;
-    }
-    ctx.syncStates.set(account.id, state);
-  }
+    })
+  );
   if (onlyAccount && out.errors.length > 0) {
     // 指定账号的同步是用户显式动作（POST /sync {accountId}），失败要能让调用方看见
     throw new Error(out.errors[0].error);
@@ -1669,10 +1919,13 @@ export function createApiServer(
           copies?: CopyRef[];
           to?: string;
           scope?: unknown;
+          /** 硬删除（不进回收站）：只用于「移出垃圾」里仅清理垃圾副本 */
+          purge?: boolean;
           /** 「全部匹配」里逐行取消掉的那几封 Message-ID；见 `scopeMessageIds` */
           exclude?: unknown;
         };
-        const op = path === "/move" ? "move" : "delete";
+        const op =
+          path === "/move" ? "move" : body.purge === true ? "purge" : "delete";
         /**
          * 范围删除（2026-10-11「全选全部匹配」）：`scope` = 列表那串查询串，口径与列表所见一致。
          * 删的是这些邮件的**全部副本**（红线 8）。
@@ -1792,6 +2045,44 @@ export function createApiServer(
       if (req.method === "GET" && path === "/contacts/suggest") {
         const own = new Set([...ctx.accounts.values()].map((a) => a.email.toLowerCase()));
         return json(res, 200, suggestContacts(ctx.db, own, url.searchParams.get("q") ?? ""));
+      }
+
+      // 服务商默认签名导入（2026-10-29）：按校验码在收件箱找到「发给自己的那封信」，
+      // 校验发件人后把正文（去掉校验行）作为签名返回。站点代理层已做 owner 保护。
+      if (req.method === "POST" && path === "/signature/import") {
+        const body = (await readBody(req)) as { accountId?: string; code?: string };
+        if (!body.accountId?.trim() || !body.code?.trim()) {
+          return json(res, 400, { error: "缺少 accountId / code" });
+        }
+        return json(res, 200, await importProviderSignature(ctx, body.accountId, body.code));
+      }
+
+      // 签名图片（公开资源，收件人邮件里的 <img> 要能直接加载；随机文件名不可枚举）
+      if (req.method === "GET" && path.startsWith("/signature-asset/")) {
+        const file = decodeURIComponent(path.slice("/signature-asset/".length));
+        if (!/^[a-f0-9]{32}\.(png|jpe?g|gif|webp)$/i.test(file)) {
+          return json(res, 404, { error: "not found" });
+        }
+        let data: Buffer;
+        try {
+          data = readFileSync(join(ctx.dataDir, "signature-assets", file));
+        } catch {
+          return json(res, 404, { error: "not found" });
+        }
+        const ext = file.split(".").pop()!.toLowerCase();
+        const type =
+          ext === "png" ? "image/png"
+          : ext === "gif" ? "image/gif"
+          : ext === "webp" ? "image/webp"
+          : "image/jpeg";
+        res.writeHead(200, {
+          "content-type": type,
+          "content-length": String(data.length),
+          "cache-control": "public, max-age=31536000, immutable",
+          "x-content-type-options": "nosniff",
+        });
+        res.end(data);
+        return;
       }
 
       if (req.method === "POST" && path === "/contacts") {

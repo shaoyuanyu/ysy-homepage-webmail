@@ -215,6 +215,35 @@ export async function moveUid(
 }
 
 /**
+ * COPY 到目标文件夹（2026-10-29）：
+ * 部分服务商（垃圾夹 → 收件箱 / 垃圾夹 → 回收站）会拒绝 MOVE 并回
+ * 「MOVE 失败: JUNK ⇄ Deleted Messages」之类的错误；`moveUid` 的兜底不是
+ * 「服务端不支持 MOVE」而是「服务端明确拒绝」，imapflow 不会自动退回复制。
+ * 这里显式 COPY 一份到目标，再由调用方清理源副本。
+ */
+export async function copyUid(
+  client: ImapFlow,
+  folder: string,
+  uid: number,
+  dest: string
+): Promise<void> {
+  await openReadWrite(client, folder);
+  const ok = await client.messageCopy(String(uid), dest, { uid: true });
+  if (!ok) throw new Error(`COPY 失败：${folder}#${uid} → ${dest}`);
+}
+
+/**
+ * 硬删除单个副本（不进回收站）：STORE \\Deleted + UID EXPUNGE。
+ * 用于「移出垃圾」时仅删掉垃圾副本（邮件本身还在收件箱），以及 COPY 兜底后的源副本清理。
+ * ⚠ 不走 `deleteUid`：那条会先尝试 MOVE 到回收站，正是服务商会拒绝的操作。
+ */
+export async function purgeUid(client: ImapFlow, folder: string, uid: number): Promise<void> {
+  await openReadWrite(client, folder);
+  const ok = await client.messageDelete(String(uid), { uid: true });
+  if (!ok) throw new Error(`删除失败：${folder}#${uid}`);
+}
+
+/**
  * 删除：有回收站则移入，否则 \Deleted + UID EXPUNGE。
  * messageDelete = 先置 \Deleted 再 UID EXPUNGE（服务端有 UIDPLUS 时只清指定 UID；
  * 无 UIDPLUS 时退化为普通 EXPUNGE，会连带清除该文件夹里其他 \Deleted 邮件）。
